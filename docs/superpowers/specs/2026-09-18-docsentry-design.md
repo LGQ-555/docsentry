@@ -1,4 +1,4 @@
-# 开发者支持 Agent（DevSupport Agent）— 设计文档
+# docsentry — 开发者支持 Agent 设计文档
 
 - 日期：2026-09-18
 - 状态：待评审（第 3 版）
@@ -189,7 +189,7 @@ class Retriever(Protocol):
 ## 5. 数据模型
 
 ```python
-# src/docqa/models.py
+# src/docsentry/models.py
 
 class SourceKind(str, Enum):
     LLMS_TXT   = "llms_txt"        # 公开文档站，可自动轮询
@@ -411,7 +411,7 @@ locator 集合 diff  →  新增 / 删除 / 保留
 - BGE 系列 query 侧需加前缀 `"Represent this sentence for searching relevant passages: "`，document 侧不加
 - Qdrant local mode：`QdrantClient(path="./data/qdrant")`
 - payload 存完整 `Chunk` 字段（含 `indexed_at`，支持过滤与取回）
-- collection 名含策略名：`docqa_structural` / `docqa_fixed` / `docqa_semantic`
+- collection 名含策略名：`docsentry_structural` / `docsentry_fixed` / `docsentry_semantic`
 
 **BM25 索引**：`rank_bm25.BM25Okapi`；英文按 `\W+` 切并小写，含中文段落用 `jieba.lcut`；持久化 `data/bm25_<strategy>.pkl`。
 
@@ -603,7 +603,7 @@ uv run scripts/run_eval.py --strategy structural --mode agent --limit 50
 ## 7. 目录结构
 
 ```
-doc-qa/
+docsentry/
 ├── README.md
 ├── pyproject.toml
 ├── .env.example
@@ -611,7 +611,7 @@ doc-qa/
 ├── configs/
 │   ├── sources.yaml
 │   └── chunking.yaml
-├── src/docqa/
+├── src/docsentry/
 │   ├── config.py
 │   ├── models.py
 │   ├── corpus/
@@ -656,7 +656,7 @@ doc-qa/
 ├── evalset/evalset.jsonl
 ├── reports/
 ├── tests/
-└── docs/superpowers/specs/2026-09-18-doc-qa-design.md
+└── docs/superpowers/specs/2026-09-18-docsentry-design.md
 ```
 
 **`.gitignore`**：`data/`、`.env`、`.venv/`、`__pycache__/`。**`evalset/evalset.jsonl` 必须提交**——核心劳动成果的证明。
