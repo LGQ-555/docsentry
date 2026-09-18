@@ -1,0 +1,30 @@
+# 数据与索引（体积大，可重新生成）
+data/
+
+# 环境
+.env
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# 模型缓存
+.cache/
+models/
+
+# 编辑器
+.vscode/
+.idea/
+
+# 报告（可重新生成，但保留 latest 以便展示）
+reports/*
+!reports/latest/
+
+# 系统
+.DS_Store
+Thumbs.db
