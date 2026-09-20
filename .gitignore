@@ -25,9 +25,8 @@ models/
 reports/*
 !reports/latest/
 
-# Claude Code — 本地私密笔记与本地设置（不公开）
-.claude/notes.md
-.claude/settings.local.json
+# Claude Code — 本地会话文件（权限记录、本地设置），不公开
+.claude/
 
 # 系统
 .DS_Store
