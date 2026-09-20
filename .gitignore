@@ -25,6 +25,10 @@ models/
 reports/*
 !reports/latest/
 
+# Claude Code — 本地私密笔记与本地设置（不公开）
+.claude/notes.md
+.claude/settings.local.json
+
 # 系统
 .DS_Store
 Thumbs.db
