@@ -69,6 +69,17 @@ Python 3.11+ · uv · Pydantic Settings · Typer · pytest
    - 可以用 LLM 生成候选，但筛选与答案校准**必须人工做过**
    - 明确禁止"全自动生成 + 全自动评判"的闭环
 
+7. **`uv.lock` 必须提交，不要加进 `.gitignore`**
+   - `pyproject.toml` 写**范围**（`httpx>=0.27`），`uv.lock` 锁**结果**（`httpx==0.28.1`），
+     且包含全部间接依赖与哈希
+   - **lockfile 不是构建产物**：`node_modules` 要忽略，`uv.lock` 要提交
+     （同类：`package-lock.json` / `poetry.lock` / `Cargo.lock`）
+   - 本项目尤其不能忽略：核心叙事是**可复现**——评测数字必须能在别人机器上跑出来。
+     依赖版本一漂，跑出的准确率就和仓库里记录的对不上，实验可信度直接崩
+   - 由 `uv sync` 自动维护，**不要手改**；改了依赖就确认 `uv.lock` 有变更并一起提交
+   - ⚠️ **它锁不住模型权重**：`bge-m3` / `bge-reranker-v2-m3` 从 HuggingFace 单独下载，
+     不在依赖树里。要真正可复现，M3 加载时须钉住 `revision`，光有 `uv.lock` 是不够的
+
 ## 语料层已实测的细节（省得重查）
 
 - `modelcontextprotocol.io/llms.txt` 是**平铺列表**，链接直达 `.md` 文件；URL 路径自带版本（`/docs/2026-07-28/`）
