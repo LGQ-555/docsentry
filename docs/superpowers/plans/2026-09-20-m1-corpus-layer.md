@@ -2924,8 +2924,10 @@ git commit -m "feat(m1): 抓取报告 — 失败清单 + 版本三分项"
 > manifest 又被丢掉，第二次同步走的是 added 分支而不是 updated，文件照样被覆写。`SourceReport` 没有
 > `__len__`，所以 `report or ...` 那半边无害，只有 manifest 这半边坏。
 > **修法**：`manifest if manifest is not None else Manifest()`（report 同改，保持一致）。
-> **同一行代码在 Task 14 的测试文件里也抄了一份，必须一并改**；且 Task 15 的 `--full` 分支会构造
-> `Manifest()`（空），——凡是 `Manifest` 参与 `or` / `if not` 的地方都按这个坑审一遍。
+> **同一行代码在 Task 14 的测试文件里也抄了一份**——但**实读后确认它没有这个缺陷**（2026-09-21 更正：
+> Task 14 的 `_sync(tmp_path, source, manifest, report=None)` 把 manifest 作**必填参数**传下去，没有 `or`
+> 回落，不存在真值陷阱。上一版这条笔记写错了，在此更正）；仍要留意 Task 15 的 `--full` 分支会构造
+> `Manifest()`（空）——凡是 `Manifest` 参与 `or` / `if not` 的地方都按这个坑审一遍。
 >
 > **B. 夹具伪造了一个真源不会有的标题（1 条）**：`FakeSource` 给 `title=Path(locator).stem`（即 `"a"`），
 > 而断言要 `"A"`（H1）。实现是 `title = ref.title or converted.title`，`"a"` 非空所以压过 H1。查证契约：
@@ -3358,7 +3360,7 @@ git commit -m "feat(m1): 同步管线插入阶段 — 并发抓取 + 失败收�
 
 > **这是 M1 最重要的一条**。设计文档 §6.1.4 写得很清楚：先删后插的缺陷是「删除完成、插入失败时，索引出现空洞且无人知晓」。下面两个测试是这条主张的**可执行证据**，不是形式化的断言。
 
-> **⚠️ 待办（2026-09-21 记录，**本任务实现时再决定要不要做**）：`vanished` 的判据不该只依赖 manifest 的记忆。**
+> **⚠️ 待办（2026-09-21 记录，**已定：先落本任务本体，C 作为紧随其后的独立 docs+feat 提交**）：`vanished` 的判据不该只依赖 manifest 的记忆。**
 > 起因见 Task 11 的 ⚠️ 第二层：manifest 读不出来时「静默重来」会让 `vanished` 变成空集，而
 > `save()` 随后按内存状态重写 manifest，消失的 locator 就永久失去了记录——**这一条对「用户手删
 > manifest.json」「非法 JSON」「I/O 读失败」三种起因都成立**。Task 11 的修法只让人**知道**基线丢了，
@@ -3618,12 +3620,13 @@ def _forget(source: Source, locator: str, docs_root: Path, manifest: Manifest) -
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `uv run pytest tests/test_pipeline_ordering.py tests/test_pipeline_insert.py -v`
-Expected: `19 passed`
+Expected: `22 passed`（原计划记 19 = 5 + 14；Task 13 实为 17，故 5 + 17 = 22）
 
 - [ ] **Step 5: 全量跑一遍**
 
 Run: `uv run pytest`
-Expected: 全绿（`148 passed, 6 deselected` —— 6 个联网验收测试被 `addopts` 排除）
+Expected: 全绿 `150 passed`（原计划记 `148 passed, 6 deselected`——那 6 个联网验收测试要等 Task 17 才存在，
+在此之前 `deselected` 为 0。）
 
 - [ ] **Step 6: 提交**
 
