@@ -1,0 +1,43 @@
+# 数据源注册表。
+#
+# 这里注册的是**指针**，不是副本 —— 系统每次运行重新读取，源变了自然被发现。
+# 这正是本项目不做"上传文档"的原因：上传产生快照，快照会过期且无人察觉。
+
+sources:
+  # MCP 官方文档站。index 是平铺列表，链接直达 .md，URL 路径自带版本。
+  #
+  # url_include 必须同时包含 /docs/ 与 /specification/：
+  #   /docs/          -> 87 个日期版 + 23 个 draft 的教程与指南
+  #   /specification/ -> 111 个日期版 + 31 个 draft 的协议规范正文
+  # 只写 /docs/ 会漏掉全部规范正文，而那正是时效性命题的核心语料（2026-07-28
+  # 协议有实质变更，证据就在 /specification/2026-07-28/ 下）。
+  #
+  # 故意**不**收录 /seps/ 与 /community/：这两类页面本身不带版本（SEP 是独立
+  # 编号的提案），收进来会让版本标注率虚降，且对"查 API 用法"帮助有限。
+  - name: mcp
+    kind: llms_txt
+    llms_txt: https://modelcontextprotocol.io/llms.txt
+    url_include:
+      - /docs/
+      - /specification/
+    keep_all_versions: true
+
+  # LangChain 官方文档站。index 是**层级**索引，指向子 llms.txt，需递归展开。
+  # /oss/python/llms.txt 展开出 369 篇，无更深嵌套。
+  #
+  # 注意：LangChain 页面 URL 与正文均不含版本信息，version 恒为 unknown。
+  # 这不是提取器缺陷，是语料性质，不要伪造版本号。
+  - name: langgraph
+    kind: llms_txt
+    llms_txt: https://docs.langchain.com/llms.txt
+    url_include:
+      - /oss/python/
+    keep_all_versions: true
+
+  # 私有语料示例。默认关闭 —— 目录不存在时开启会让每次抓取都报一堆失败。
+  # 演示私有语料接入时：把文档丢进 data/internal_docs/，把 enabled 改 true。
+  - name: internal
+    kind: local_dir
+    path: ./data/internal_docs
+    default_version: "internal-2026Q3"
+    enabled: false
