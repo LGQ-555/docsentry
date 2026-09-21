@@ -3672,6 +3672,33 @@ git commit -m "feat(m1): 先插后删 — 崩溃时留下冗余而非索引空�
 - Create: `scripts/fetch_corpus.py`
 - Test: `tests/test_fetch_corpus_cli.py`
 
+> **⚠️ 计划 Step 3 欠了 Task 11 那笔账，另有两条自家承诺无人看守；Step 2 的红色预期也写错了（2026-09-21 实测，已修）**
+>
+> **① `ManifestUnreadable` 没有被 catch（Task 11 的 ⚠️ 里明确写过「连带 Task 15：`fetch_corpus.py` 要 catch
+> `ManifestUnreadable` 打一句可操作的话」）。** 实测：把 `data/manifest.json` 写成 `{not json` 后跑 CLI →
+> `exit_code=1`、**输出 0 行**（CliRunner 把 traceback 收进 `result.exception`），路径与恢复办法都不出现。
+> 用户拿到的是 traceback。**修法**：`Manifest.load` 包 try/except，`exit 2` + 打印 `{exc}`（含路径与原因）
+> + 一行 `delete <path> to rebuild it from scratch: every page is then re-fetched.`
+> 实测这条修法是**唯一**会造成行为变化的改动：把 3 条新测试打回未修补的计划实现，**只挂这一条**。
+>
+> **② 幂等**（模块 docstring 的头号承诺：「running it twice in a row is a no-op the second time. That is the
+> property the health check and the scheduled task both depend on」）：实测**行为是对的**（第二次
+> `added=0 updated=0 skipped=1`），但**非联网测试一条都没覆盖**——只有 Task 17 那条联网验收在管它。
+> 补 `test_second_run_is_a_no_op`（守卫，实现不动）。
+>
+> **③ `write_corpus` docstring 声称 "atomically, sorted by doc_id for reproducibility"**：实测**行为也是对的**
+> （倒序喂进去 → 输出按 doc_id 有序、无 `.tmp` 残留），同样没有测试。补
+> `test_corpus_jsonl_is_sorted_and_leaves_no_temp_file`（守卫，实现不动）。
+>
+> **Step 2 的红色预期写错**：`scripts/` 已是包（有空 `__init__.py`）但没有 `fetch_corpus.py`，
+> 所以实际是 `ModuleNotFoundError: No module named 'scripts.fetch_corpus'`，不是
+> `ImportError: cannot import name 'app' from 'scripts.fetch_corpus'`。
+>
+> **Task 14 那条提醒已无需改动**：`--full` 的帮助文本 `Ignore the manifest and re-fetch everything` 在 C 落地后
+> 是准确的（它重抓每个页面；删除判定已不依赖 manifest，所以不受影响）。
+>
+> 测试 5 → 8（补 1 条修法测试 + 2 条守卫）。
+
 - [ ] **Step 1: 写失败测试**
 
 ```python
@@ -3818,7 +3845,9 @@ def test_missing_config_exits_nonzero(tmp_path):
 - [ ] **Step 2: 跑测试确认失败**
 
 Run: `uv run pytest tests/test_fetch_corpus_cli.py -v`
-Expected: FAIL — `ImportError: cannot import name 'app' from 'scripts.fetch_corpus'`
+Expected: FAIL — `ModuleNotFoundError: No module named 'scripts.fetch_corpus'`
+（原计划记 `ImportError: cannot import name 'app' ...`。`scripts/` 是包但该模块不存在，
+所以是 ModuleNotFoundError；见本任务开头的 ⚠️。）
 
 - [ ] **Step 3: 实现 `scripts/fetch_corpus.py`**
 
@@ -3979,7 +4008,7 @@ if __name__ == "__main__":
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `uv run pytest tests/test_fetch_corpus_cli.py -v`
-Expected: `5 passed`
+Expected: `8 passed`（原计划记 5；补 1 条修法测试 + 2 条守卫后为 8）
 
 - [ ] **Step 5: 提交**
 
