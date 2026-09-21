@@ -1868,6 +1868,21 @@ git commit -m "feat(m1): llms.txt 抓取 — 返回原始字节，异常向上�
 
 > **不复制文件**。design spec 6.1.2 的核心主张：注册的是**指针**。索引每次重扫目录，文件改了自然被 hash 发现——因此**不需要 watchdog 常驻监控**，索引本来就是定期/手动触发的批处理。
 
+> **⚠️ Step 1 的两条 fetch 测试在 Windows 上不可满足，Step 3 的实现本身无误（2026-09-21 实测，已修）**：
+> `test_fetch_reads_current_bytes` 与 `test_fetch_sees_an_edit` 用
+> `target.write_text("# A\n", encoding="utf-8")` 造样本，却断言
+> `fetched.data == b"# A\n"`。Windows 下 `write_text` 以文本模式打开、
+> `newline=None`，会把 `\n` 翻译成 `\r\n` 落盘——磁盘上实际是 `b"# A\r\n"`，
+> **这两条断言在任何正确实现下都不成立**（本平台实测 FAILED，而 `read_bytes`
+> 的行为是对的：content_hash 必须看到磁盘上真实的那串字节）。
+> **修法**：fixture 改用 `write_bytes`，写成它断言的那串字节，跨平台都成立。
+>
+> 另补一条 `test_fetch_returns_bytes_verbatim`，钉住 `read_bytes` 的原样返回。
+> 它同时记录一处**合法差异**：本地文件在 Windows 上带 `\r\n`，这个 `\r\n` 会进
+> `content_hash`；而转换器用 `read_text` 读回（universal newlines）时 CRLF 已归一成
+> LF，所以换行符不会渗进 chunk 文本。实测：`write_bytes(b'# A\r\n')` 之后
+> `read_text` 得到 `'# A\n'`。两条路径各司其职，不是缺陷。
+
 - [ ] **Step 1: 写失败测试**
 
 ```python
@@ -2063,7 +2078,7 @@ class LocalDirectorySource:
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `uv run pytest tests/test_local_dir_source.py -v`
-Expected: `12 passed`
+Expected: `13 passed`（原计划记 12；补 1 条 verbatim 回归后为 13）
 
 - [ ] **Step 5: 提交**
 
