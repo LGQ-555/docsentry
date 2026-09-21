@@ -2905,6 +2905,57 @@ git commit -m "feat(m1): 抓取报告 — 失败清单 + 版本三分项"
 
 > 本任务只做**插入阶段**，删除阶段在 Task 14。分开是因为 Task 14 要验证的「先插后删」顺序是本里程碑的核心主张，值得独立测试。
 
+> **⚠️ Step 1 的夹具有两处缺陷，Step 3 的实现本身无误；另有 3 条契约没被任何测试钉住（2026-09-21 实测，已修）**
+> 实测：计划 14 条在 scratch 里**只过 8 条**。逐条定位后，两条根因都在夹具，修完夹具 14/14 全绿。
+>
+> **A. 真值陷阱（5 条挂在这里）**：夹具 `_sync` 写的是
+>
+> ```python
+> manifest=manifest or Manifest(),   report=report or SourceReport(...)
+> ```
+>
+> `Manifest` 实现了 `__len__`，于是**空 manifest 是 falsy**，调用者传进来的空 manifest 被替换成一个临时对象，
+> `sync_source` 的写入全落在马上被丢弃的那个上。所有「第一次同步之后再检查 manifest」的测试因此必挂
+> （`test_manifest_records_hash_and_version`、`test_second_sync_skips_unchanged_pages`、
+> `test_second_sync_refreshes_fetched_at`、`test_missing_raw_file_is_rewritten...`、
+> `test_changed_page_is_reported_as_updated`）。
+>
+> **反证比正面证据更值得记**：`test_changed_page_overwrites_raw_file` **通过了，但通过的原因是错的**——
+> manifest 又被丢掉，第二次同步走的是 added 分支而不是 updated，文件照样被覆写。`SourceReport` 没有
+> `__len__`，所以 `report or ...` 那半边无害，只有 manifest 这半边坏。
+> **修法**：`manifest if manifest is not None else Manifest()`（report 同改，保持一致）。
+> **同一行代码在 Task 14 的测试文件里也抄了一份，必须一并改**；且 Task 15 的 `--full` 分支会构造
+> `Manifest()`（空），——凡是 `Manifest` 参与 `or` / `if not` 的地方都按这个坑审一遍。
+>
+> **B. 夹具伪造了一个真源不会有的标题（1 条）**：`FakeSource` 给 `title=Path(locator).stem`（即 `"a"`），
+> 而断言要 `"A"`（H1）。实现是 `title = ref.title or converted.title`，`"a"` 非空所以压过 H1。查证契约：
+>
+> | 证据 | 内容 |
+> |---|---|
+> | `sources/local_dir.py` | `title=""`，注释 "derived from the document's first heading" |
+> | 设计文档 §6.2 | 「`llms_txt` 源已自带标题，这一步是让裸 `local_dir` 也能用」 |
+>
+> 即**源标题优先、空标题回落 H1**——实现是对的，夹具的 stub 标题把回落分支堵死了。
+> **修法**：夹具改成带 `title` 参数、默认 `""`（对齐 `LocalDirectorySource`）。
+>
+> **C. 夹具的 `discover()` 自己先排了序**（`sorted(self.pages)`），于是 `_fetch_all` 里那句
+> 「Ordering the result by locator」永远测不到。改成按插入顺序返回——源本来就允许返回索引顺序，
+> `sync_source` 承诺的是**它自己**的输出有序。
+>
+> **补 3 条测试**（都是实现 docstring 已经声明、而计划一条都没钉的契约）：
+> - `test_source_title_wins_over_the_heading`：钉住 B 那个方向（llms_txt 标题优先）。缺了它，
+>   将来把实现改成 `converted.title or ref.title` 不会有任何测试报警。
+> - `test_documents_come_back_sorted_by_locator`：钉住 `_fetch_all` docstring 的排序承诺
+>   （Task 7 已有同样先例：契约写了 sorted，就得有测试）。
+> - `test_raw_write_is_atomic_and_leaves_no_part_file`：`_atomic_write` 承诺 "never leave a
+>   half-written page"，而 manifest 有对应的 `*.tmp` 测试、raw 写入器没有。
+>
+> 测试 14 → 17。
+>
+> **顺带记一条待办（不在本任务）**：`Converter.supported` 至今**没有调用方按扩展名派发**——
+> M1 只有 `MarkdownConverter` 一个实现、源也只产 `.md`，所以现在无害；等选做的 `PdfConverter`
+> 落地时，pipeline 需要一个「按扩展名选转换器」的分派点，别到时候才想起来。
+
 - [ ] **Step 1: 写失败测试**
 
 ```python
@@ -3288,7 +3339,7 @@ def _try_fetch(source: Source, ref: DocRef) -> tuple[DocRef, Fetched | None, str
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `uv run pytest tests/test_pipeline_insert.py -v`
-Expected: `14 passed`
+Expected: `17 passed`（原计划记 14；补 3 条契约测试后为 17）
 
 - [ ] **Step 5: 提交**
 
@@ -3333,6 +3384,10 @@ git commit -m "feat(m1): 同步管线插入阶段 — 并发抓取 + 失败收�
 >
 > 影响面：Task 14 的 `test_removed_page_is_deleted` / `test_insert_happens_before_delete` 需各补一条
 > 「manifest 缺失时仍能删掉消失的页面」的用例；Task 17 的验收数字不变。
+>
+> **Task 15 的 `--full` 走的是同一条路**（`manifest = Manifest()` 是空 manifest → `vanished=∅` → 那一轮
+> 不做删除，随后 `save()` 覆写。用户是主动要求的，所以不算缺陷，但**语义要在 CLI 帮助里写明**：
+> `--full` 不等于"重新核对删除"，它放弃这一轮的删除判定。做了上面的判据改造后这条自动变好。
 
 - [ ] **Step 1: 写失败测试**
 
