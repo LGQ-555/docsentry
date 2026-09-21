@@ -2345,6 +2345,57 @@ git commit -m "feat(m1): Markdown 转换器 — 剥样板块 + 提标题"
 - Create: `src/docsentry/corpus/manifest.py`
 - Test: `tests/test_manifest.py`
 
+> **⚠️ Step 3 的 `load` 没有兑现自己 docstring 里的契约；而且 docstring 的成本核算本身不完整（2026-09-21 实测 + 复核，已修）**
+>
+> **第一层：实现只挡了非法 JSON。** docstring 写「a missing or **unreadable** file means 'start over'」，
+> 实现却只 catch `(FileNotFoundError, json.JSONDecodeError, OSError)` —— 这是**枚举**而不是**推理**
+> 异常层级（`FileNotFoundError` ⊂ `OSError`，本身就是冗余项），于是两类「读不出来」逃了出去。
+> 实测（离线脚本，8 个样本）：
+>
+> | `manifest.json` 内容 | 原 `load` 的行为 |
+> |---|---|
+> | `{not json`（**Step 1 唯一测的场景**） | 返回空 ✓ |
+> | 非法 UTF-8 字节 | `UnicodeDecodeError` —— ⊂ `ValueError`，**不是** `OSError` |
+> | `[]` / `null` / `"hello"` | `AttributeError: 'list' object has no attribute 'items'` |
+> | `{"…": null}` | `TypeError: 'NoneType' object is not subscriptable` |
+> | `{"…": "nope"}` | `TypeError: string indices must be integers` |
+> | `{"…": {"content_hash": "h"}}` | `KeyError: 'version'` |
+>
+> **第二层：真正该修的不是「崩」，是「静默重来」的成本被算错了。** 「崩」只发生在畸形文件上，
+> 且 fail-fast（`load` 在整次运行**开头**调用，见 Task 13 的 `_rerun`），恢复靠删文件——这一半确实轻。
+> 但计划里那条**已通过的** `test_load_corrupt_file_returns_empty`（非法 JSON → 返回空，不崩）走的
+> 恰恰是更坏的一条路，而 docstring 的成本核算漏了一半：
+>
+> > "Rebuilding from an unreadable manifest costs one full re-fetch"
+>
+> 实际不止。manifest 不只是「我们有什么」的缓存，它同时是**删除检测的基线**（Task 14）：
+>
+> ```python
+> vanished = sorted(manifest.locators() - discovered)   # 空 manifest → vanished = ∅
+> ```
+>
+> 于是：① 该删的页面**一个都不删**——`_forget` 是全模块唯一 unlink raw 文件的地方；
+> ② `report.deleted=0`，而这一格分不清「没有页面消失」和「基线丢了」，它正是 §6.1.5 为「静默缺口」建的；
+> ③ **永久的**：本次结束 `save()` 按内存状态重写 manifest，而内存里只剩本次 discover 到的 locator，
+> 消失的 locator 从此既不在 manifest 也不在源——下次运行同样检测不到，**追不回来**。
+>
+> （`except OSError` 那一支——`PermissionError`，Windows 上被杀毒/索引器/云同步客户端锁住文件——
+> 给的是进同一状态的**第二条**路，但窗口窄得多：要「读失败、写成功」才永久丢；锁通常两边都锁，
+> 于是崩在 `save`，旧 manifest 完好无损。记录在案，不作主要论据。）
+>
+> **修法：把「没有记录」与「读不出来」分开。**
+> - `FileNotFoundError` → 返回空。首次运行本来就没有基线，无损失——这才是 docstring 说的 start over。
+> - 其余（`OSError` / `UnicodeDecodeError` / `JSONDecodeError` / 顶层不是对象 / entry 不是对象或字段缺失）
+>   → 抛 `ManifestUnreadable`，带路径与原因。人要删文件才能重建，**但删之前他知道了「基线丢了」**。
+> - `ManifestUnreadable` **不继承 `OSError`**——有一条测试钉死这点。否则将来某个 `except OSError`
+>   会把它静默吞掉，等于把这次修的东西原样再挖一遍。
+> - 形状不对时**整份作废**（抛错），不做部分加载：与 docstring 同一理由，宁可全量重检，
+>   也不要「一半信旧的、一半当新的」。
+>
+> 连带 Task 15：`fetch_corpus.py` 要 catch `ManifestUnreadable` 打一句可操作的话（路径 + 原因 + 怎么重建），
+> 否则用户看到的是一条 traceback。测试 11 → 15（改 1 条、补 4 条）。
+> **根治不在这里**——见 Task 14 开头的 ⚠️：让删除判据不再依赖 manifest 的记忆，manifest 丢失才真正只值一次重抓。
+
 - [ ] **Step 1: 写失败测试**
 
 ```python
@@ -2575,7 +2626,7 @@ class Manifest:
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `uv run pytest tests/test_manifest.py -v`
-Expected: `11 passed`
+Expected: `15 passed`（原计划记 11；改 1 条 + 补 4 条后为 15）
 
 - [ ] **Step 5: 提交**
 
@@ -3243,6 +3294,33 @@ git commit -m "feat(m1): 同步管线插入阶段 — 并发抓取 + 失败收�
 - Test: `tests/test_pipeline_ordering.py`
 
 > **这是 M1 最重要的一条**。设计文档 §6.1.4 写得很清楚：先删后插的缺陷是「删除完成、插入失败时，索引出现空洞且无人知晓」。下面两个测试是这条主张的**可执行证据**，不是形式化的断言。
+
+> **⚠️ 待办（2026-09-21 记录，**本任务实现时再决定要不要做**）：`vanished` 的判据不该只依赖 manifest 的记忆。**
+> 起因见 Task 11 的 ⚠️ 第二层：manifest 读不出来时「静默重来」会让 `vanished` 变成空集，而
+> `save()` 随后按内存状态重写 manifest，消失的 locator 就永久失去了记录——**这一条对「用户手删
+> manifest.json」「非法 JSON」「I/O 读失败」三种起因都成立**。Task 11 的修法只让人**知道**基线丢了，
+> 没有让「丢基线」这件事变得无害。根治在这里：
+>
+> **判据换成两条取并集**——manifest 的记忆（管 manifest 条目清理）+ raw 目录的现存文件（管磁盘自愈）：
+>
+> ```python
+> protected = {ensure_within(docs_root / raw_relpath(ref.locator), docs_root) for ref in refs}
+> stragglers = {p for p in docs_root.rglob("*") if p.is_file()} - protected
+> ```
+>
+> 这样 manifest 全丢也只值一次重抓，删除判定照样能从文件树恢复——docstring 那句
+> 「start over 是安全的失败方向」**才真正成立**（现在是不成立的，因为基线不在 raw 树里）。
+>
+> **三条必须钉住的性质**（否则这个改法比原方案更危险）：
+> 1. `protected` 必须由 **`discover()` 的全部结果**算，**不是**由「抓取成功的那些」算——
+>    否则一个临时 404 就会让 `_forget` 删掉 raw 文件，把「抓取失败」升级成「静默删数据」。
+> 2. 作用域仍限 `docs_root = raw_root / source.name`，且路径一律过 `ensure_within`——
+>    两个源列同一个 URL 时不能互删（现有 `_forget` 已有此保证，改判据不能丢）。
+> 3. `raw_relpath` 的清洗**不可逆**（`a:b.md` 与 `a_b.md` 落同一路径），所以**不能**用 raw 路径反推
+>    locator。此改法只需要「这个文件不该在」这个结论，不需要知道它是谁——**别顺手写反推**。
+>
+> 影响面：Task 14 的 `test_removed_page_is_deleted` / `test_insert_happens_before_delete` 需各补一条
+> 「manifest 缺失时仍能删掉消失的页面」的用例；Task 17 的验收数字不变。
 
 - [ ] **Step 1: 写失败测试**
 
