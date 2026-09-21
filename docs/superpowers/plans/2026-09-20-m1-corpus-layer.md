@@ -1270,7 +1270,15 @@ git commit -m "feat(m1): Source 协议 — 数据源可替换点"
 > 复核的其他数字**全部无误**：MCP 347 条唯一 `.md`（过滤后 252）、LangChain
 > `/oss/python/llms.txt` 369 条唯一 `.md`；两边均 0 个 URL 含 `?` / `#` / `:` 或端口。
 > 一处新增：MCP 的 `llms.txt` 有 **352 条链接但仅 347 唯一**——文件内 5 条重复，
-> **解析必须去重**。
+> **解析必须去重**（注：`test_discover_deduplicates_repeated_entries` 已覆盖此点）。
+>
+> **⚠️ 一处测试缺口，实现本任务时补上（2026-09-21 发现）**：Step 3 的实现里有
+> `sorted(found.values(), key=lambda ref: ref.locator)`，但 Step 1 的 18 个测试
+> **没有一条断言顺序**。Task 9 有对应的
+> `test_discover_finds_markdown_recursively_and_sorted`，Task 7 缺——而 Task 7
+> 要遍历子索引树与 `dict`，顺序**恰恰不是天然确定的**（Task 9 反倒已钉住）。
+> 请补一条 `test_discover_is_sorted`，钉住 `Source.discover()` docstring 里
+> "sorted" 这个契约。
 
 - [ ] **Step 1: 写失败测试**
 
