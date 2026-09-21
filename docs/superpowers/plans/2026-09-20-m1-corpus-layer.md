@@ -1280,6 +1280,28 @@ git commit -m "feat(m1): Source 协议 — 数据源可替换点"
 > 请补一条 `test_discover_is_sorted`，钉住 `Source.discover()` docstring 里
 > "sorted" 这个契约。
 
+> **⚠️ 实现时发现第二处顺序缺陷，Step 3 的代码不能照抄（2026-09-21，已修）**：
+> `return refs if self.keep_all_versions else prune_to_latest(refs)` 在
+> `keep_all_versions: false` 分支上**返回的不是有序结果**——`prune_to_latest` 的
+> 输出是「无版本页在前，每组各一条在后」，只在本任务那条测试的样本里碰巧有序。实测反例：
+>
+> | 表达式 | 返回顺序 |
+> |---|---|
+> | `prune_to_latest([docs/2025-11-25/a.md, docs/2026-07-28/a.md, seps/1-a.md])` | `[seps/1-a.md, docs/2026-07-28/a.md]` |
+> | 按 locator 排序后 | `[docs/2026-07-28/a.md, seps/1-a.md]` |
+>
+> 语料越大越明显：MCP 的 `/seps/`、`/community/`、`/registry/`、`/extensions/`
+> **全是无版本页**，会整体排到 `/docs/`、`/specification/` 之前——而字典序是
+> `docs < extensions < registry < seps < specification`。当前两份源都写着
+> `keep_all_versions: true`，线上跑不到这条分支；但契约写的是 sorted，就得两条路径都排。
+> **修法**：取 `found.values()` → 需要剪枝时剪枝 → **最后统一 sort**（改动 3 行）。
+> 新增回归测试 `test_discover_is_sorted_when_pruning`。
+>
+> **另补一条 `test_discover_handles_a_mixed_index`**：上面第一条 ⚠️ 说 LangChain
+> 顶层两种形态并存，但 Step 1 的层级测试**全是纯子索引文件**，没有一条覆盖「一个文件里
+> 两种链接混排」。实测复核顶层：177 条唯一链接 = **58 子索引 + 119 直连 `.md`**，
+> 与警告里的数字一致；MCP 侧 352 条 → 347 唯一，`/docs/` + `/specification/` = 110 + 142 = **252**。
+
 - [ ] **Step 1: 写失败测试**
 
 ```python
@@ -1699,7 +1721,7 @@ class LlmsTxtSource:
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `uv run pytest tests/test_llms_txt_discover.py -v`
-Expected: `19 passed`
+Expected: `22 passed`（原计划记 19；补 3 条顺序 / 混排测试后为 22）
 
 - [ ] **Step 5: 提交**
 
