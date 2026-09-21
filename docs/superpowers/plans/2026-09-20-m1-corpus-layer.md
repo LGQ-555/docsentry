@@ -1849,7 +1849,7 @@ Expected: FAIL — `NotImplementedError` on every fetch test
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `uv run pytest tests/test_llms_txt_fetch.py tests/test_llms_txt_discover.py -v`
-Expected: `25 passed`
+Expected: `28 passed`（原计划记 25 = 6 + 19；Task 7 补了 3 条，实为 6 + 22）
 
 - [ ] **Step 5: 提交**
 

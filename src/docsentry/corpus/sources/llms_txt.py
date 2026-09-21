@@ -173,4 +173,13 @@ class LlmsTxtSource:
         return response.text
 
     def fetch(self, ref: DocRef) -> Fetched:
-        raise NotImplementedError  # implemented in Task 8
+        """Download one page's raw bytes.
+
+        Returns bytes rather than text: ``response.content`` is the body *after*
+        content-encoding is undone (MCP serves gzip) but *before* any text
+        decoding. Hashing that is stable if the server switches compression,
+        and a future non-UTF-8 format is not silently mangled on the way in.
+        """
+        response = self.client.get(ref.locator)
+        response.raise_for_status()
+        return Fetched(ref=ref, data=response.content, fetched_at=utcnow())
