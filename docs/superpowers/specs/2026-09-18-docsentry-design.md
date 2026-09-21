@@ -202,7 +202,7 @@ class SourceKind(str, Enum):
 class DocRef:
     source: str
     kind: SourceKind
-    locator: str          # URL 或本地路径
+    locator: str          # URL；或 local_dir 的「相对源目录的路径」，如 sub/a.md
     version_hint: str | None
 
 @dataclass
@@ -211,7 +211,7 @@ class Document:
     source: str
     kind: SourceKind
     version: str          # "2026-07-28"，提取不到为 "unknown"
-    url: str              # 展示用来源链接
+    url: str              # 展示用来源链接（local_dir 即上面的相对 locator）
     title: str
     path: str
     content: str          # 统一为 Markdown

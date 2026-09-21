@@ -1868,6 +1868,40 @@ git commit -m "feat(m1): llms.txt 抓取 — 返回原始字节，异常向上�
 
 > **不复制文件**。design spec 6.1.2 的核心主张：注册的是**指针**。索引每次重扫目录，文件改了自然被 hash 发现——因此**不需要 watchdog 常驻监控**，索引本来就是定期/手动触发的批处理。
 
+> **⚠️ 本任务与本任务之后的一个决定组合不起来：绝对路径 locator 在 Windows 上打不通管线（2026-09-21 实测，已修）**
+> 起因是 Task 15 的真源冒烟：`local_dir` 源跑 CLI 时**整次运行中止**，
+> `ValueError: refusing to touch C:\...\docs\a.md: outside C:\...\data\raw\internal`。
+> 单元层面复现（不用起 CLI）：
+>
+> | 步骤 | 值 |
+> |---|---|
+> | `LocalDirectorySource.discover()[0].locator` | `C:\Users\…\docs\a.md` |
+> | `paths.raw_relpath(locator)` | `'\Users\LGQ\…\docs\a.md'` |
+> | `ensure_within(docs_root / 上面那个, docs_root)` | **ValueError（拒绝）** |
+>
+> 根因是一条**缝**：Step 3 决定「locator 是绝对路径」（`test_locator_is_an_absolute_path` 钉着），
+> 而 Task 5 的 `raw_relpath` 是按 URL 设计的（`urlparse` 取 scheme/netloc、按 `/` 分段）——
+> `C:` 被当成 URL scheme 吃掉，剩下整串成为一个含反斜杠的段，构造出的 `Path` 带盘符锚点。
+> **POSIX 上恰好能跑**（`/home/u/docs/a.md` 会被切成正常段），所以这是一个 **Windows-only** 缺陷，
+> 而本项目跑在 Windows 上。设计文档 §205 写的是 `locator: str # URL 或本地路径`——允许本地路径，
+> 但没说它长什么样，两个实现各挑了一种形状，**没有任何测试跨过这条缝**
+> （Task 9 测 discover/fetch，Task 13 用 URL locator 测管线；Task 17 的验收只跑两个联网源）。
+>
+> **修法**：locator 改成**相对源目录的 POSIX 路径**（`a.md`、`sub/b.md`），`fetch` 改成
+> `(self.path / ref.locator).read_bytes()`。理由不只是"能跑通"：
+> `doc_id = sha256(source + locator)[:16]`，**绝对路径会把机器布局烧进每一个 id**——搬目录或换机器
+> 读同一份语料，全部本地文档换 id、索引整体重建。相对 locator 让私有语料与公开语料一样可复现
+> （这是 C 与 Task 9 之外、项目命题本身的要求）。绝对位置仍然可查：源配置里有，`Document.path` 也有。
+>
+> **测试 13 → 15**：`test_locator_is_an_absolute_path` 换成
+> `test_locator_is_relative_to_the_source_directory`（断言 POSIX 分隔符、无盘符），另补两条跨模块的
+> **缝测试**：`test_local_document_survives_the_pipeline`（真源走完 `sync_source` → raw 文件落盘 →
+> `Document.url == "a.md"`）与 `test_doc_id_does_not_depend_on_where_the_directory_lives`
+> （同一份内容放两个不同绝对目录，`doc_id` 相同）。实测：这三条打回未修补的实现全红，其余 12 条全过。
+>
+> 附带印证：写缝测试时我自己又踩了一次上面那条 Windows 陷阱（`write_text` 造样本 + 断言 `bytes`），
+> 证明这类夹具缺陷会反复出现——**断言 bytes 就用 `write_bytes`**。
+
 > **⚠️ Step 1 的两条 fetch 测试在 Windows 上不可满足，Step 3 的实现本身无误（2026-09-21 实测，已修）**：
 > `test_fetch_reads_current_bytes` 与 `test_fetch_sees_an_edit` 用
 > `target.write_text("# A\n", encoding="utf-8")` 造样本，却断言
@@ -2078,7 +2112,7 @@ class LocalDirectorySource:
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `uv run pytest tests/test_local_dir_source.py -v`
-Expected: `13 passed`（原计划记 12；补 1 条 verbatim 回归后为 13）
+Expected: `15 passed`（原计划记 12；补 1 条 verbatim 回归后为 13，再换 1 条 / 补 2 条缝测试后为 15）
 
 - [ ] **Step 5: 提交**
 
