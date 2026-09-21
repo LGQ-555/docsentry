@@ -1093,10 +1093,25 @@ def ensure_within(path: Path, root: Path) -> Path:
     return resolved
 ```
 
+> **⚠️ 上面 Step 3 的代码有缺陷，不要照抄（2026-09-21 修正）。**
+>
+> | 断言（Windows） | Step 3 原实现 | 修正后 |
+> |---|---|---|
+> | `raw_relpath("https://example.com/a:b.md").name` | `b.md` | `a_b.md` |
+> | 两个不同 host 的 `x:y.md` 路径 | **相同（撞了）** | 不同 |
+> | `raw_relpath("https://example.com/")` | 返回 `example.com` | `ValueError` |
+>
+> 根因：清洗发生在 `Path()` 构造**之后**，而 Windows 下 `:` 是**盘符分隔符**，于是
+> `Path("example.com") / "a:b*c"` 求值为 `a:b*c`——主机段被整个丢弃，本模块"两 host
+> 不撞"的保证随之失效。修法：**先按段清洗，再构造 `Path`**；另，除主机外无路径段时
+> 抛 `ValueError`。原测试还有一条期望在任何实现下都不可达（且与
+> `test_query_string_is_dropped` 的 `?` 语义互斥），已替换为良定义用例 + 一条回归测试。
+> 完整证据见 commit `0a5a9b7` 的 message。
+
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `uv run pytest tests/test_paths.py -v`
-Expected: `8 passed`
+Expected: `9 passed`（原计划记 8，修正后为 9）
 
 - [ ] **Step 5: 提交**
 
@@ -1246,6 +1261,16 @@ git commit -m "feat(m1): Source 协议 — 数据源可替换点"
 > - **层级** — `docs.langchain.com/llms.txt` 列出的是**子索引**（`.../llms.txt`），必须递归展开
 >
 > 递归上限 `MAX_INDEX_DEPTH = 2`，用已访问集合防环。实测 LangChain 只需 1 层，上限是安全网。
+>
+> **⚠️ 上面这个分法是简化，2026-09-21 复核发现反例**：LangChain 顶层 `llms.txt`
+> **同一个文件里两种形态并存**——58 个 `llms.txt` 子索引在 `### Section indexes` 下，
+> 另有 **119 条直连 `.md`** 分散在 `## Docs` / `## Open source` / `## LangSmith Fleet` /
+> `## Agent Server API` 四段。所以 `discover()` **不能按文件二选一**，必须同时走两条路。
+>
+> 复核的其他数字**全部无误**：MCP 347 条唯一 `.md`（过滤后 252）、LangChain
+> `/oss/python/llms.txt` 369 条唯一 `.md`；两边均 0 个 URL 含 `?` / `#` / `:` 或端口。
+> 一处新增：MCP 的 `llms.txt` 有 **352 条链接但仅 347 唯一**——文件内 5 条重复，
+> **解析必须去重**。
 
 - [ ] **Step 1: 写失败测试**
 
