@@ -49,12 +49,39 @@ def sync_source(
     report.discovered = len(refs)
     docs_root = raw_root / source.name
 
+    discovered = {ref.locator for ref in refs}
+    vanished = sorted(manifest.locators() - discovered)
+
     # ---- insert phase: new and changed content lands on disk first --------
     documents: list[Document] = []
     for fetched in _fetch_all(source, refs, workers, report):
         documents.append(_absorb(source, converter, fetched, docs_root, manifest, report))
 
+    # ---- delete phase: only once the new content is safely in place -------
+    for locator in vanished:
+        _forget(source, locator, docs_root, manifest)
+        report.deleted += 1
+
     return documents
+
+
+def _forget(source: Source, locator: str, docs_root: Path, manifest: Manifest) -> None:
+    """Drop one vanished document: its raw file first, then its manifest entry.
+
+    Scoped to ``docs_root`` -- this source's own subtree -- so a source can
+    never delete another source's files, even if two sources list the same URL.
+
+    The order inside this function does not matter for correctness, because the
+    durable artifact (``manifest.json``) is only written at the very end of the
+    run by the caller. A crash here is recovered by the next run, which sees the
+    pre-crash manifest and simply retries the delete.
+    """
+    try:
+        path = ensure_within(docs_root / raw_relpath(locator), docs_root)
+        path.unlink(missing_ok=True)
+    except (ValueError, OSError):
+        pass  # an un-derivable or already-gone path is not worth failing the run
+    manifest.remove(locator)
 
 
 def _absorb(
