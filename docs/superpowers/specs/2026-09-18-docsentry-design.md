@@ -57,11 +57,13 @@
 | 源 | llms.txt | 形态 | 版本信息 |
 |---|---|---|---|
 | MCP | `https://modelcontextprotocol.io/llms.txt` | 平铺列表，链接指向 `.md` | ✅ URL 路径自带：`/docs/2026-07-28/` |
-| LangGraph / LangChain | `https://docs.langchain.com/llms.txt` | **层级索引**，指向子 `llms.txt` | 需从路径或内容提取 |
+| LangGraph / LangChain | `https://docs.langchain.com/llms.txt` | **混合**：58 个 `llms.txt` 子索引 + 119 条直连 `.md`（同一文件内并存） | 需从路径或内容提取 |
 
 实测：`https://docs.langchain.com/oss/python/langgraph/overview.md` → HTTP 200，`Content-Type: text/markdown`。
 
-**HTTP 缓存实测结论**：MCP 文档站**无 ETag**，`Last-Modified` 是站点构建时间（非内容修改时间）**不可靠**。因此 **`content_hash` 是唯一可靠的变更判据**，必须全量下载比对。成本可接受（单页约 3 KB × 400 页 ≈ 1.2 MB）。
+**语料规模实测（2026-09-21 复核）**：MCP 347 条唯一 `.md`（经 `url_include` 过滤后 252）；LangChain 顶层为 58 个子索引 + 119 条直连 `.md`，其 `/oss/python/llms.txt` 展开出 369 条唯一 `.md`。两边**均 0 个** URL 含 `?` / `#` / `:` 或端口。MCP 的 `llms.txt` 含 **5 条重复链接**（352 条链接 / 347 唯一），**解析器必须去重**。
+
+**HTTP 缓存实测结论**：MCP 文档站**无 ETag**，`Last-Modified` 是站点构建时间（非内容修改时间）**不可靠**。因此 **`content_hash` 是唯一可靠的变更判据**，必须全量下载比对。成本可接受（单页约 3 KB × 621 页 ≈ 1.8 MB；621 = MCP 过滤后 252 + LangChain 369）。
 
 ---
 
@@ -300,6 +302,8 @@ sources:
 2. 解析行格式 `- [title](url): description`
 3. **条目 URL 以 `llms.txt` 结尾 → 子索引，递归展开**（`docs.langchain.com` 即此形态），最多 2 层，用已访问集合防环
 4. 收集 `.md` 结尾条目；目录项（以 `/` 结尾）跳过
+5. **同一文件内两种形态可能并存，按文件二选一是错的**：`docs.langchain.com` 顶层既有 58 个 `llms.txt` 子索引（`### Section indexes` 下），又有 119 条直连 `.md`（散在 `## Docs` / `## Open source` / `## LangSmith Fleet` / `## Agent Server API`），两条路都要走
+6. **按 URL 去重后再交给上层**：MCP 的 `llms.txt` 实测 352 条链接 / 347 唯一
 
 #### 6.1.4 增量更新（v3 修正为"先插后删"）
 
@@ -595,8 +599,11 @@ uv run scripts/run_eval.py --strategy structural --mode agent --limit 50
 | **LLM 调用外发** | 仅发送检索到的片段，不发送全库；配置项支持切换本地 Ollama 完全离线 | ✅ 架构支持，需补开关 |
 | **权限隔离** | 检索层加 ACL 过滤 | ❌ 明确不做（见 §8.4） |
 | **审计日志** | 记录谁问了什么、检索到什么 | ❌ 明确不做 |
+| **不可信输入写盘** | locator→路径推导先按段清洗，再由 `ensure_within` 兜底 | ✅ M1 已实现 |
 
 **设计说明（权限隔离）**："企业场景需要按角色过滤检索结果，实现上是在检索层加 ACL 过滤条件——我的 `retrieve()` 已支持版本和时间过滤，加权限过滤是同一套机制。我两周内没做，因为判断把时间花在验证切片策略的量化收益上更有价值。"
+
+**设计说明（不可信输入）**：`llms.txt` 是远端文件，等同不可信输入——它可以把 `../` 或 Windows 非法字符塞进 URL 路径。所有写盘与删除前都要过 `raw_relpath` 清洗 + `ensure_within` 越界兜底。**实测教训：清洗必须发生在构造 `Path` 之前。** Windows 下 `:` 是盘符分隔符，`Path("example.com") / "a:b*c"` 求值为 `a:b*c`，主机段被整个丢弃——`https://a.example.com/x:y.md` 与 `https://b.example.com/x:y.md` 于是推出相同路径，"两 host 不撞"的保证静默失效。先构造再清洗就太晚了。
 
 ---
 
