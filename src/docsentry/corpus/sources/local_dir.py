@@ -38,7 +38,14 @@ class LocalDirectorySource:
         return True
 
     def discover(self) -> list[DocRef]:
-        """Every matching file under the directory, absolute paths, sorted.
+        """Every matching file under the directory, relative POSIX paths, sorted.
+
+        Locators are *relative to this directory*, not absolute. The locator is
+        the document's identity -- ``doc_id`` hashes it -- so an absolute path
+        would bake the machine's layout into every id: move the corpus, or read
+        it on another machine, and the whole source re-keys and the index
+        rebuilds from scratch. The absolute location still lives where it
+        belongs: in the source config, and in ``Document.path`` once ingested.
 
         A missing directory yields nothing rather than raising: the source may
         legitimately be empty (the shipped config disables it for that reason),
@@ -56,7 +63,7 @@ class LocalDirectorySource:
                     DocRef(
                         source=self.name,
                         kind=self.kind,
-                        locator=str(file.resolve()),
+                        locator=file.relative_to(self.path).as_posix(),
                         version_hint=self.default_version,
                         title="",  # derived from the document's first heading
                     )
@@ -68,6 +75,6 @@ class LocalDirectorySource:
         """Read current bytes. Sees edits immediately -- there is no cache."""
         return Fetched(
             ref=ref,
-            data=Path(ref.locator).read_bytes(),
+            data=(self.path / ref.locator).read_bytes(),
             fetched_at=utcnow(),
         )
