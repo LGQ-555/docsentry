@@ -50,7 +50,13 @@ def sync_source(
     docs_root = raw_root / source.name
 
     discovered = {ref.locator for ref in refs}
+    # Decided before anything is touched, from two independent judges: the
+    # manifest remembers what this source used to have, and the raw tree shows
+    # what is actually on disk. Neither alone is enough -- a lost manifest
+    # would disable deletion entirely, while a file with no manifest entry can
+    # only be found by looking at the tree.
     vanished = sorted(manifest.locators() - discovered)
+    stragglers = _stragglers(docs_root, refs, vanished)
 
     # ---- insert phase: new and changed content lands on disk first --------
     documents: list[Document] = []
@@ -59,13 +65,19 @@ def sync_source(
 
     # ---- delete phase: only once the new content is safely in place -------
     for locator in vanished:
-        _forget(source, locator, docs_root, manifest)
-        report.deleted += 1
+        if _forget(source, locator, docs_root, manifest):
+            report.deleted += 1
+
+    # Files the manifest no longer remembers. A non-zero count here is the
+    # visible trace of a lost or ignored manifest being healed by the tree.
+    for path in stragglers:
+        if _discard(path):
+            report.deleted += 1
 
     return documents
 
 
-def _forget(source: Source, locator: str, docs_root: Path, manifest: Manifest) -> None:
+def _forget(source: Source, locator: str, docs_root: Path, manifest: Manifest) -> bool:
     """Drop one vanished document: its raw file first, then its manifest entry.
 
     Scoped to ``docs_root`` -- this source's own subtree -- so a source can
@@ -75,13 +87,65 @@ def _forget(source: Source, locator: str, docs_root: Path, manifest: Manifest) -
     durable artifact (``manifest.json``) is only written at the very end of the
     run by the caller. A crash here is recovered by the next run, which sees the
     pre-crash manifest and simply retries the delete.
+
+    Returns whether the file is gone. The manifest entry goes either way: it is
+    the part that must not linger, and a file that could not be removed becomes
+    a straggler next run, which needs no locator to be found again.
+    """
+    path = _raw_path(docs_root, locator)
+    gone = True if path is None else _discard(path)
+    manifest.remove(locator)
+    return gone
+
+
+def _raw_path(docs_root: Path, locator: str) -> Path | None:
+    """Resolved raw path for a locator, or ``None`` if it cannot be derived.
+
+    ``None`` covers a locator with no usable path segments (``raw_relpath``
+    raises) and one that would escape ``docs_root`` (``ensure_within`` refuses).
     """
     try:
-        path = ensure_within(docs_root / raw_relpath(locator), docs_root)
-        path.unlink(missing_ok=True)
+        return ensure_within(docs_root / raw_relpath(locator), docs_root)
     except (ValueError, OSError):
-        pass  # an un-derivable or already-gone path is not worth failing the run
-    manifest.remove(locator)
+        return None
+
+
+def _discard(path: Path) -> bool:
+    """Unlink a raw file; ``True`` if it is gone. A locked file is not fatal."""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        return False  # locked: it stays on disk and is retried next run
+    return True
+
+
+def _stragglers(docs_root: Path, refs: list[DocRef], vanished: list[str]) -> list[Path]:
+    """Raw files under ``docs_root`` that no known document claims.
+
+    This is what makes a lost manifest cost one re-fetch instead of silently
+    disabling deletion: the raw tree is the durable record, the manifest only a
+    memory of it. Compensation for the memory being gone, nothing more -- every
+    page still in the source is claimed and therefore safe.
+
+    Claimed paths come from **every discovered ref**, not from the ones that
+    fetched successfully, so a transient 404 can never turn into a deletion.
+
+    Both sides are compared *resolved*: ``_absorb`` writes to the resolved path
+    while ``rglob`` echoes back the root it was handed, and with a relative or
+    dot-containing data dir those two disagree -- which would make every live
+    file look unclaimed.
+
+    ``raw_relpath`` sanitises, so a path cannot be turned back into a locator.
+    This function never tries: "this file is not claimed" is all it needs.
+    """
+    claimed = {_raw_path(docs_root, ref.locator) for ref in refs}
+    claimed |= {_raw_path(docs_root, locator) for locator in vanished}
+    claimed.discard(None)
+    if not docs_root.exists():
+        return []
+    return sorted(
+        path for path in docs_root.rglob("*") if path.is_file() and path.resolve() not in claimed
+    )
 
 
 def _absorb(

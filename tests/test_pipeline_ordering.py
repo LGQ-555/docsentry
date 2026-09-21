@@ -12,10 +12,11 @@ from docsentry.models import DocRef, SourceKind, utcnow
 
 
 class FakeSource:
-    def __init__(self, name="fake", pages=None):
+    def __init__(self, name="fake", pages=None, fail_on=()):
         self.name = name
         self.kind = SourceKind.LLMS_TXT
         self.pages = dict(pages or {})
+        self.fail_on = set(fail_on)
 
     def discover(self):
         return [
@@ -24,6 +25,8 @@ class FakeSource:
         ]
 
     def fetch(self, ref):
+        if ref.locator in self.fail_on:
+            raise RuntimeError(f"boom: {ref.locator}")
         return Fetched(ref=ref, data=self.pages[ref.locator], fetched_at=utcnow())
 
     def refreshable(self):
@@ -54,11 +57,11 @@ class ExplodingOnRemoveManifest(RecordingManifest):
         raise RuntimeError("crash during delete phase")
 
 
-def _sync(tmp_path, source, manifest, report=None):
+def _sync(tmp_path, source, manifest, report=None, raw_root=None):
     return sync_source(
         source=source,
         converter=MarkdownConverter(),
-        raw_root=tmp_path / "raw",
+        raw_root=raw_root if raw_root is not None else tmp_path / "raw",
         manifest=manifest,
         report=report or SourceReport(name=source.name, kind="llms_txt"),
         workers=1,
@@ -75,10 +78,10 @@ def _seed(tmp_path, pages, *, name="fake"):
     return source, path
 
 
-def _rerun(tmp_path, source, manifest_path, report=None):
+def _rerun(tmp_path, source, manifest_path, report=None, raw_root=None):
     """A subsequent run: load the manifest, sync, save. No crash simulation."""
     manifest = Manifest.load(manifest_path)
-    documents = _sync(tmp_path, source, manifest, report)
+    documents = _sync(tmp_path, source, manifest, report, raw_root=raw_root)
     manifest.save(manifest_path)
     return documents
 
@@ -167,3 +170,68 @@ def test_delete_phase_removes_only_this_sources_files(tmp_path):
 
     assert not _raw(tmp_path, "fake", "x", "a.md").exists()
     assert _raw(tmp_path, "other", "x", "x.md").exists()
+
+
+# --- deletion does not depend on the manifest's memory ---------------------
+
+
+def test_vanished_page_is_deleted_even_when_the_manifest_is_lost(tmp_path):
+    """The raw tree is the durable record; the manifest is only a memory of it."""
+    source, manifest_path = _seed(
+        tmp_path, {"https://x/keep.md": b"# Keep\n", "https://x/gone.md": b"# Gone\n"}
+    )
+    source.pages = {"https://x/keep.md": b"# Keep\n"}
+    manifest_path.unlink()  # deleted by hand, or lost to damage
+
+    report = SourceReport(name="fake", kind="llms_txt")
+    _rerun(tmp_path, source, manifest_path, report=report)
+
+    assert not _raw(tmp_path, "fake", "x", "gone.md").exists()
+    assert _raw(tmp_path, "fake", "x", "keep.md").exists()
+    assert report.deleted == 1
+    assert report.added == 1  # the price of a lost manifest: everything re-adds
+
+
+def test_page_whose_fetch_failed_is_not_deleted(tmp_path):
+    """Claimed paths come from discover(), never from what fetched cleanly."""
+    source, manifest_path = _seed(
+        tmp_path, {"https://x/a.md": b"# A\n", "https://x/b.md": b"# B\n"}
+    )
+    source.fail_on = {"https://x/b.md"}
+
+    report = SourceReport(name="fake", kind="llms_txt")
+    _rerun(tmp_path, source, manifest_path, report=report)
+
+    assert _raw(tmp_path, "fake", "x", "b.md").exists()
+    assert report.deleted == 0
+
+
+def test_unclaimed_file_in_the_raw_tree_is_cleaned_up(tmp_path):
+    """data/raw/<source>/ holds what we fetched, and nothing else."""
+    source, manifest_path = _seed(tmp_path, {"https://x/a.md": b"# A\n"})
+    stray = _raw(tmp_path, "fake", "x", "stray.md")
+    stray.write_bytes(b"# Stray\n")
+
+    report = SourceReport(name="fake", kind="llms_txt")
+    _rerun(tmp_path, source, manifest_path, report=report)
+
+    assert not stray.exists()
+    assert _raw(tmp_path, "fake", "x", "a.md").exists()
+    assert report.deleted == 1
+
+
+def test_straggler_check_compares_resolved_paths(tmp_path):
+    """A dot segment in the data dir must not turn every live file into a straggler.
+
+    ``_absorb`` writes the *resolved* path while ``rglob`` echoes back the root
+    it was handed, so an unresolved comparison finds no overlap -- and deletes
+    the source's whole raw tree.
+    """
+    source, manifest_path = _seed(tmp_path, {"https://x/a.md": b"# A\n"})
+    dotted = tmp_path / "raw" / ".." / "raw"
+
+    report = SourceReport(name="fake", kind="llms_txt")
+    _rerun(tmp_path, source, manifest_path, report=report, raw_root=dotted)
+
+    assert _raw(tmp_path, "fake", "x", "a.md").exists()
+    assert report.deleted == 0
