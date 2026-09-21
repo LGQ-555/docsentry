@@ -2645,6 +2645,18 @@ git commit -m "feat(m1): manifest 变更检测 — 只存 hash/版本/校验时�
 
 > 设计文档 §6.1.5 的话值得引在这里：**最大的风险不是「更新慢」，而是「你以为更新了，其实某个源抓失败了，索引缺内容是静默的」。** 报告的存在就是为了让失败和缺口可见。
 
+> **⚠️ Step 3 的 `summary()` 没兑现自己 docstring 那句 "failures first"，Step 1 的测试碰不到（2026-09-21 实测，已修）**：
+> docstring 承诺 "Human-readable block for the console, **failures first**"，但实现把失败行放在**每个源自己那一块里**——计数行与版本行之后。实测（2 个源 / mcp 内 1 条 404）：`failed` 首次出现在第 4 行（共 10 行），即 60% 处；源越多埋得越深，而末行 `total` 永不含失败数。计划的
+> `test_summary_mentions_failures_when_present` 只断言 `"1 failed" in text`（子串存在），**没有一条测试管顺序**——又是一处「测试通过 ≠ 契约成立」。
+>
+> 为什么值得修（不是排版洁癖）：§6.1.5 说头号风险是「你以为更新了，其实某个源抓失败了，索引缺内容是静默的」，控制台是这个风险的**人眼通道**，「失败优先」是它的设计意图而不是修辞。
+>
+> **修法**：失败行从各源块里提到 header 之后、第一个 `discovered=` 之前，汇成一块；每行**前置源名**（移出各源块后，源名不能再靠位置隐含）；`FetchReport` 新增 `failures` 属性（`(source, locator, error)` 展平，源顺序、源内按 locator 排序）。**0 失败时输出逐字节不变**（实测）——计划那条 quiet 测试与 Task 17 的验收控制台断言都不受影响。测试 11 → 13（补 `test_summary_puts_failures_before_the_counts`、`test_summary_groups_failures_from_every_source_with_their_source_name`）。
+>
+> 顺带查掉、**确认不是缺陷**：`failed` / `versions` 的可变默认值不跨实例共享；源名长于 10 字符时列会错位（`{name:<10}`，纯观感，不修）。
+>
+> **明确不动的决定**：`totals` 不加失败计数——JSON 的 `sources[i]["failed"]` 已带全量信息，而把 `failed=0` 追加到末行会与 `test_summary_is_quiet_when_nothing_failed`（quiet 时整份输出不含 "failed"）自相矛盾。
+
 - [ ] **Step 1: 写失败测试**
 
 ```python
@@ -2874,7 +2886,7 @@ class FetchReport:
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `uv run pytest tests/test_report.py -v`
-Expected: `11 passed`
+Expected: `13 passed`（原计划记 11；补 2 条顺序测试后为 13）
 
 - [ ] **Step 5: 提交**
 
