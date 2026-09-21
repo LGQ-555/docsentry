@@ -3360,7 +3360,7 @@ git commit -m "feat(m1): 同步管线插入阶段 — 并发抓取 + 失败收�
 
 > **这是 M1 最重要的一条**。设计文档 §6.1.4 写得很清楚：先删后插的缺陷是「删除完成、插入失败时，索引出现空洞且无人知晓」。下面两个测试是这条主张的**可执行证据**，不是形式化的断言。
 
-> **⚠️ 待办（2026-09-21 记录，**已定：先落本任务本体，C 作为紧随其后的独立 docs+feat 提交**）：`vanished` 的判据不该只依赖 manifest 的记忆。**
+> **⚠️ 已落地（2026-09-21，本任务本体之后一个独立 docs+feat 提交）：`vanished` 的判据不再只依赖 manifest 的记忆。**
 > 起因见 Task 11 的 ⚠️ 第二层：manifest 读不出来时「静默重来」会让 `vanished` 变成空集，而
 > `save()` 随后按内存状态重写 manifest，消失的 locator 就永久失去了记录——**这一条对「用户手删
 > manifest.json」「非法 JSON」「I/O 读失败」三种起因都成立**。Task 11 的修法只让人**知道**基线丢了，
@@ -3388,8 +3388,37 @@ git commit -m "feat(m1): 同步管线插入阶段 — 并发抓取 + 失败收�
 > 「manifest 缺失时仍能删掉消失的页面」的用例；Task 17 的验收数字不变。
 >
 > **Task 15 的 `--full` 走的是同一条路**（`manifest = Manifest()` 是空 manifest → `vanished=∅` → 那一轮
-> 不做删除，随后 `save()` 覆写。用户是主动要求的，所以不算缺陷，但**语义要在 CLI 帮助里写明**：
-> `--full` 不等于"重新核对删除"，它放弃这一轮的删除判定。做了上面的判据改造后这条自动变好。
+> 不做删除，随后 `save()` 覆写）。判据改造后这条**已被兜住**：空 manifest 只剩 raw 树判断，
+> 该删的照样删。CLI 帮助里仍值得写明 `--full` 的语义（忽略 manifest 记忆，不忽略文件系统）。
+>
+> **已落地的形态**：两个独立判断，都在插入之前算好，删除阶段分开计数。
+>
+> | 判断 | 来源 | 管什么 |
+> |---|---|---|
+> | `vanished = manifest.locators() - discovered` | manifest 的记忆 | 删 raw 文件 + 清 manifest 条目 |
+> | `stragglers = raw 树现存文件 − 被认领的路径` | raw 树（**durable**） | 删 raw 文件（没有 locator 可清） |
+>
+> 两者不相交（`stragglers` 排除了 `vanished` 的路径），所以一个文档只计一次数。新增
+> `_raw_path`（推导失败返回 `None`）/ `_discard`（容忍被锁文件）/ `_stragglers`；`_forget` 改为返回
+> bool，`report.deleted` 现在只统计**真的删掉了**的。
+>
+> **证据（三个变体实测，不是推理）**：
+> - **计划原实现（pre-C）**：`test_vanished_page_is_deleted_even_when_the_manifest_is_lost` 与
+>   `test_unclaimed_file_in_the_raw_tree_is_cleaned_up` 两条红 —— 新能力真实存在。
+> - **C**：26 条全绿（17 插入 + 9 顺序）。
+> - **naive 变体一**（两侧不 `resolve`，直接比路径）：只挂 `test_straggler_check_compares_resolved_paths`
+>   一条，现场是 `a.md` **被删掉了**。机制：数据目录写成 `data/raw/../raw` 这种形态时，`rglob`
+>   回显它收到的那个根，而 `_absorb` 写的是 resolve 后的路径，两者不重叠 ⇒ 整棵 raw 树被当成无主
+>   文件清空。**这是本次改动里唯一能造成数据丢失的实现方式，所以必须有测试钉住。**
+> - **naive 变体二**（`claimed` 只用抓取成功的 refs 算）：只挂 `test_page_whose_fetch_failed_is_not_deleted`
+>   一条，现场是 `b.md` 被删 —— 临时 404 升级成静默删数据。
+>
+> 两个 naive 变体都**只挂对应那一条**，说明这两条守卫测的正是它们声称的事，不是恒真。
+>
+> **一处刻意引入的语义变化**：`data/raw/<source>/` 下**未被认领的文件会被删除**——包括手工放进去的、
+> 以及 `_atomic_write` 崩溃留下的 `.part`。理由：这个目录是我们抓下来的副本，不是用户放东西的地方，
+> 而"树是权威"正是 C 成立的前提。已用 `test_unclaimed_file_in_the_raw_tree_is_cleaned_up` 钉住；
+> 若将来要改成"只清理我们能识别的"，那条测试就是改动的入口。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -3620,12 +3649,12 @@ def _forget(source: Source, locator: str, docs_root: Path, manifest: Manifest) -
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `uv run pytest tests/test_pipeline_ordering.py tests/test_pipeline_insert.py -v`
-Expected: `22 passed`（原计划记 19 = 5 + 14；Task 13 实为 17，故 5 + 17 = 22）
+Expected: `26 passed`（原计划记 19 = 5 + 14；Task 13 实为 17、C 给顺序文件补 4 条，故 9 + 17 = 26）
 
 - [ ] **Step 5: 全量跑一遍**
 
 Run: `uv run pytest`
-Expected: 全绿 `150 passed`（原计划记 `148 passed, 6 deselected`——那 6 个联网验收测试要等 Task 17 才存在，
+Expected: 全绿 `154 passed`（原计划记 `148 passed, 6 deselected`——那 6 个联网验收测试要等 Task 17 才存在，
 在此之前 `deselected` 为 0。）
 
 - [ ] **Step 6: 提交**
