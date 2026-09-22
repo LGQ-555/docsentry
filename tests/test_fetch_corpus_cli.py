@@ -14,6 +14,16 @@ sources:
     llms_txt: https://x/llms.txt
 """
 
+TWO_SOURCE_CONFIG = """
+sources:
+  - name: alpha
+    kind: llms_txt
+    llms_txt: https://alpha.example.com/llms.txt
+  - name: beta
+    kind: llms_txt
+    llms_txt: https://beta.example.com/llms.txt
+"""
+
 
 def _write_config(tmp_path, body=CONFIG):
     path = tmp_path / "sources.yaml"
@@ -185,8 +195,8 @@ def _invoke(tmp_path, monkeypatch, **stub_kwargs):
 def test_damaged_manifest_exits_with_an_actionable_message(tmp_path):
     """Task 11's debt: an unreadable manifest must not reach the user as a traceback."""
     data = tmp_path / "data"
-    data.mkdir()
-    (data / "manifest.json").write_text("{not json", encoding="utf-8")
+    (data / "manifests").mkdir(parents=True)
+    (data / "manifests" / "one.json").write_text("{not json", encoding="utf-8")
 
     result = runner.invoke(
         app,
@@ -198,7 +208,7 @@ def test_damaged_manifest_exits_with_an_actionable_message(tmp_path):
     )
 
     assert result.exit_code == 2
-    assert "manifest.json" in result.output  # which file
+    assert "one.json" in result.output  # which file
     assert "delete" in result.output  # and what to do about it
     assert "Traceback" not in result.output
 
@@ -226,3 +236,82 @@ def test_corpus_jsonl_is_sorted_and_leaves_no_temp_file(tmp_path, monkeypatch):
     assert ids == sorted(ids)
     assert ids[0] == make_doc_id("one", "https://x/a.md")  # handed back z first
     assert list((tmp_path / "data").glob("*.tmp")) == []
+
+
+# --- two sources in one run ------------------------------------------------
+#
+# The deletion baseline is per-source, so one shared manifest makes each source
+# see the others' locators as vanished. Every other test here syncs a single
+# source, which is exactly why this went unnoticed until the M1 acceptance run.
+
+
+def _pages(name, locator):
+    from docsentry.corpus.sources.base import Fetched
+    from docsentry.models import DocRef, SourceKind, utcnow
+
+    class StubSource:
+        kind = SourceKind.LLMS_TXT
+
+        def __init__(self):
+            self.name = name
+
+        def discover(self):
+            return [DocRef(source=name, kind=self.kind, locator=locator, title=name)]
+
+        def fetch(self, ref):
+            return Fetched(ref=ref, data=f"# {name}\nbody\n".encode(), fetched_at=utcnow())
+
+        def refreshable(self):
+            return True
+
+    return StubSource()
+
+
+def _invoke_two_sources(tmp_path, monkeypatch):
+    import scripts.fetch_corpus as cli
+
+    stubs = {
+        "alpha": _pages("alpha", "https://alpha.example.com/docs/a.md"),
+        "beta": _pages("beta", "https://beta.example.com/docs/b.md"),
+    }
+    monkeypatch.setattr(cli, "build_source", lambda config, settings: stubs[config.name])
+    return runner.invoke(
+        app,
+        [
+            "--config", str(_write_config(tmp_path, TWO_SOURCE_CONFIG)),
+            "--data-dir", str(tmp_path / "data"),
+            "--reports-dir", str(tmp_path / "reports"),
+        ],
+    )
+
+
+def _counts(tmp_path):
+    payload = json.loads((tmp_path / "reports" / "latest" / "fetch.json").read_text(encoding="utf-8"))
+    return {source["name"]: source for source in payload["sources"]}
+
+
+def test_one_source_never_deletes_another_sources_documents(tmp_path, monkeypatch):
+    result = _invoke_two_sources(tmp_path, monkeypatch)
+
+    assert result.exit_code == 0, result.output
+    counts = _counts(tmp_path)
+    assert counts["alpha"]["added"] == 1
+    assert counts["beta"]["added"] == 1
+    # Nothing has vanished from either source on a first run.
+    assert counts["alpha"]["deleted"] == 0, "alpha's documents were counted as vanished during beta's sync"
+    assert counts["beta"]["deleted"] == 0
+
+
+def test_two_sources_are_idempotent_across_runs(tmp_path, monkeypatch):
+    """The scheduled task's premise, which only holds if the baselines are separate."""
+    _invoke_two_sources(tmp_path, monkeypatch)
+
+    result = _invoke_two_sources(tmp_path, monkeypatch)
+
+    assert result.exit_code == 0, result.output
+    for name, counts in _counts(tmp_path).items():
+        assert (counts["added"], counts["updated"], counts["deleted"]) == (0, 0, 0), (
+            f"{name} churned on a second run: {counts}"
+        )
+        assert counts["skipped"] == counts["discovered"] == 1
+

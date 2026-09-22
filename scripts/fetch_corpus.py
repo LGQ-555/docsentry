@@ -99,11 +99,17 @@ def main(
             typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
             raise typer.Exit(code=2)
 
-    if full:
-        manifest = Manifest()  # empty manifest == everything looks new
-    else:
+    # One manifest per source, all loaded before anything is fetched: a damaged
+    # baseline should abort the whole run rather than half of it. Sharing one
+    # file across sources would make each source read the others' locators as
+    # vanished -- see Settings.manifest_path_for.
+    manifests: dict[str, Manifest] = {}
+    for source_config in selected:
+        if full:
+            manifests[source_config.name] = Manifest()  # empty == everything looks new
+            continue
         try:
-            manifest = Manifest.load(settings.manifest_path)
+            manifests[source_config.name] = Manifest.load(settings.manifest_path_for(source_config.name))
         except ManifestUnreadable as exc:
             # Aborting beats pretending the file was absent: the manifest is
             # also the deletion baseline, so rebuilding it quietly costs more
@@ -130,14 +136,15 @@ def main(
                 source=live,
                 converter=MarkdownConverter(),
                 raw_root=settings.raw_dir,
-                manifest=manifest,
+                manifest=manifests[source_config.name],
                 report=source_report,
                 workers=settings.fetch_workers,
             )
         )
         reports.append(source_report)
 
-    manifest.save(settings.manifest_path)
+    for name, source_manifest in manifests.items():
+        source_manifest.save(settings.manifest_path_for(name))
     write_corpus(settings.corpus_path, documents)
 
     report = FetchReport(started_at=started, duration_s=time.perf_counter() - clock, sources=reports)

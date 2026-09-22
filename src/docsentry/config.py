@@ -7,12 +7,17 @@ the ``Source`` abstraction.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# A source name becomes both a directory (``raw/<name>/``) and a filename
+# (``manifests/<name>.json``), so it has to be a plain path segment.
+_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 class SourceConfig(BaseModel):
@@ -30,6 +35,17 @@ class SourceConfig(BaseModel):
     # local_dir
     path: Path | None = None
     default_version: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _name_is_a_path_segment(cls, value: str) -> str:
+        # Rejecting ``../x`` and ``a/b`` here rather than sanitising at the
+        # write site: the name is an identifier, and a name that cannot name a
+        # directory is a config error. Same class as the drive-letter escape in
+        # corpus/paths.py, caught earlier.
+        if not _NAME_RE.fullmatch(value):
+            raise ValueError(f"source name {value!r} must be a plain identifier (letters, digits, . _ -)")
+        return value
 
     @field_validator("url_include", mode="before")
     @classmethod
@@ -79,8 +95,19 @@ class Settings(BaseSettings):
         return self.data_dir / "raw"
 
     @property
-    def manifest_path(self) -> Path:
-        return self.data_dir / "manifest.json"
+    def manifests_dir(self) -> Path:
+        return self.data_dir / "manifests"
+
+    def manifest_path_for(self, source_name: str) -> Path:
+        """One manifest per source.
+
+        The manifest is the deletion baseline (``pipeline`` computes ``vanished``
+        as the locators it remembers minus the ones it found), so a single file
+        shared by every source would make each source treat the others' pages as
+        vanished: it would drop their entries, report their count as ``deleted``,
+        and re-add them as new on the next run. See the design spec 6.1.4.
+        """
+        return self.manifests_dir / f"{source_name}.json"
 
     @property
     def corpus_path(self) -> Path:

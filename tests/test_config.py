@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from docsentry.config import Settings, load_sources_config
+from docsentry.config import Settings, SourceConfig, load_sources_config
 
 
 def _write(tmp_path: Path, body: str) -> Path:
@@ -90,8 +90,23 @@ def test_settings_derives_paths(tmp_path):
     settings = Settings(data_dir=tmp_path / "data", reports_dir=tmp_path / "reports")
 
     assert settings.raw_dir == tmp_path / "data" / "raw"
-    assert settings.manifest_path == tmp_path / "data" / "manifest.json"
+    assert settings.manifests_dir == tmp_path / "data" / "manifests"
     assert settings.corpus_path == tmp_path / "data" / "corpus.jsonl"
+
+
+def test_manifest_path_is_per_source(tmp_path):
+    """One baseline per source -- a shared file makes each source delete the others'."""
+    settings = Settings(data_dir=tmp_path / "data")
+
+    assert settings.manifest_path_for("mcp") == tmp_path / "data" / "manifests" / "mcp.json"
+    assert settings.manifest_path_for("mcp") != settings.manifest_path_for("langgraph")
+
+
+@pytest.mark.parametrize("name", ["../escape", "a/b", "a\\b", "", "."])
+def test_source_name_must_be_a_path_segment(name):
+    """The name becomes a directory and a filename, so it cannot climb out."""
+    with pytest.raises(ValidationError):
+        SourceConfig(name=name, kind="llms_txt", llms_txt="https://x/llms.txt")
 
 
 def test_settings_env_override(monkeypatch, tmp_path):
