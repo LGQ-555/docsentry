@@ -1,13 +1,20 @@
 # tests/test_health.py
 import json
+import os
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from docsentry.corpus.manifest import Manifest, ManifestEntry
 from scripts.health import app, stale_documents
 
 runner = CliRunner()
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 NOW = datetime(2026, 9, 20, 12, 0, tzinfo=timezone.utc)
 
@@ -105,6 +112,38 @@ def test_cli_handles_missing_manifest(tmp_path):
     assert "no manifest" in result.output.lower()
 
 
+def test_cli_merges_every_source_manifest(tmp_path, monkeypatch):
+    """One manifest per source, so the default view is all of them together."""
+    data = tmp_path / "data"
+    manifests = data / "manifests"
+    manifests.mkdir(parents=True)
+    (manifests / "mcp.json").write_text(json.dumps({"https://m/a.md": _entry("2026-07-28")}), encoding="utf-8")
+    (manifests / "langgraph.json").write_text(json.dumps({"https://l/a.md": _entry("unknown")}), encoding="utf-8")
+    monkeypatch.setenv("DOCSENTRY_DATA_DIR", str(data))
+
+    result = runner.invoke(app, ["--now", NOW.isoformat()])
+
+    assert result.exit_code == 0, result.output
+    assert "documents: 2" in result.output
+    assert "1 dated, 0 draft, 1 unknown" in result.output
+    assert "2 sources" in result.output
+
+
+def test_cli_aborts_on_any_unreadable_manifest_not_just_the_first(tmp_path, monkeypatch):
+    """Merging must not dilute the rule the guard tests below pin down."""
+    data = tmp_path / "data"
+    manifests = data / "manifests"
+    manifests.mkdir(parents=True)
+    (manifests / "a-good.json").write_text(json.dumps({"https://x/a.md": _entry()}), encoding="utf-8")
+    (manifests / "z-broken.json").write_text("{not json", encoding="utf-8")
+    monkeypatch.setenv("DOCSENTRY_DATA_DIR", str(data))
+
+    result = runner.invoke(app, ["--now", NOW.isoformat()])
+
+    assert result.exit_code == 2
+    assert "no manifest" not in result.output.lower()
+
+
 def test_cli_refuses_to_report_on_an_unreadable_manifest(tmp_path):
     # The plan's loader caught the exception and returned {} -- a corrupt
     # manifest was reported as an absent one with exit code 0, which a
@@ -130,3 +169,40 @@ def test_cli_refuses_on_undecodable_bytes(tmp_path):
 
     assert result.exit_code == 2
     assert "unreadable" in result.output.lower()
+
+
+# --- the command line the plan actually documents --------------------------
+#
+# Every test above calls the Typer app object through CliRunner, which never
+# needs the module to be *executable*. So all of them passed while
+# `uv run scripts/health.py` -- the invocation in the plan and the only one a
+# user types -- was a silent no-op: no `__main__` guard, exit 0, no output.
+
+SCRIPTS = sorted(path for path in (REPO_ROOT / "scripts").glob("*.py") if path.name != "__init__.py")
+
+
+@pytest.mark.parametrize("script", SCRIPTS, ids=lambda path: path.name)
+def test_every_script_has_a_command_line_entry_point(script):
+    result = subprocess.run(
+        [sys.executable, str(script), "--help"], capture_output=True, text=True, cwd=REPO_ROOT
+    )
+
+    assert result.returncode == 0, f"{script.name} is not runnable: {result.stderr}"
+    assert "usage" in result.stdout.lower()
+
+
+def test_health_script_reports_when_run_as_documented(tmp_path):
+    data = tmp_path / "data"
+    (data / "manifests").mkdir(parents=True)
+    (data / "manifests" / "one.json").write_text(json.dumps({"https://x/a.md": _entry()}), encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" / "health.py"), "--now", NOW.isoformat()],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        env={**os.environ, "DOCSENTRY_DATA_DIR": str(data)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "documents: 1" in result.stdout
