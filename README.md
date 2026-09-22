@@ -74,7 +74,8 @@ problem, not a research one.
 ## Progress
 
 - [x] Design document — architecture, module design, experiment design, limitations
-- [ ] Corpus pipeline — `llms.txt` discovery, incremental update, manifest
+- [x] **M1 corpus layer** — `llms_txt` + `local_dir` sources, `content_hash` incremental
+      update (insert-then-delete), per-source manifests, fetch report, health check
 - [ ] Chunking strategies — fixed / semantic / structural
 - [ ] Indexing & hybrid retrieval
 - [ ] Generation with citations and provenance
@@ -82,6 +83,11 @@ problem, not a research one.
 - [ ] LangGraph orchestration + pipeline-vs-agent ablation
 - [ ] Freshness experiment (model-only / stale / fresh)
 - [ ] Results, failure analysis, write-up
+
+Corpus today: **774 documents** — MCP 252 (198 dated + 54 draft, **100 % version-labelled**)
+and LangChain Python 522 (versionless by nature). 17 upstream pages are *reported* rather than
+silently dropped: 16 the site serves as `text/html` instead of Markdown, 1 returning 404.
+Re-running the fetch changes nothing (`added=0 updated=0 deleted=0`).
 
 ## Design document
 

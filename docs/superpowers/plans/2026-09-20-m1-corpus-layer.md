@@ -4864,6 +4864,21 @@ git commit -m "feat(m1): health 脚本 — 版本分布 + 陈旧告警"
 > `test_documents_are_real_markdown_with_titles` 更名为 `test_mcp_documents_are_real_markdown_with_titles`
 > 并限定到 MCP；`test_second_run_skips_everything` 的核算改为「skipped + failed == discovered」，
 > 因为失败页本来就不会被 skip）。
+>
+> **补记（同日，用户定的）：6 条只读测试改用共享 fixtures。** 原写法每条测试各自 sync 自己需要的源，
+> 实测 **9 分 40 秒 / 约 5250 次请求**——同一份上游状态在一次运行里被下载了 6–7 遍。改成
+> module 作用域的 `synced` fixture（两源各抓一次，仍然共用一个 `raw_root`、仍按配置顺序），
+> 于是：**4 分 57 秒 / 约 2370 次请求**。
+>
+> **没有削弱的守卫**：A 的守卫（一个进程里两源先后写进同一 `raw_root`，断言 `deleted == 0`）由 fixture
+> 本身承担；C 的守卫仍扫全部 774 篇；版本/标题/失败归因全部照旧。**削弱的只是冗余**——两源序列原本跑 3 遍、
+> mcp 同步跑 4 遍，而对活语料来说一次运行内重复上游状态买不到东西。
+> **代价（如实记下）**：setup 出问题会以 ERROR 挂在 6 条测试上，第一眼看到的失败未必是根因；
+> 且读代码的人必须看 fixture 才知道测试的起点。
+>
+> **`test_second_run_skips_everything` 保持自闭环**（自己的 data dir、自己跑两遍）：幂等性 *就是*
+> 「同一目录连跑两次」，借别人的基线会让这条测试依赖夹具的执行顺序，且窗口内上游内容真变了会误报。
+> 因此套件里仍有两次全量跑省不掉——这是这条性质的固有成本，不是夹具的缺陷。
 
 - [ ] **Step 1: 写验收测试**
 
@@ -4874,7 +4889,9 @@ Excluded by default (see pyproject `addopts`). Run with:
 
     uv run pytest -m network -v
 
-Slow by design: it downloads both corpora end to end.
+Slow by design: it downloads both corpora end to end. Six of the eight tests
+read one shared first-run sync (see the `synced` fixture); only the idempotence
+test re-fetches, because two consecutive runs *are* its subject.
 
 This is the only test that talks to the real internet, and the first live run
 (2026-09-22) is why it exists: it found that a page the site does not publish
@@ -4917,15 +4934,18 @@ def sources():
     return {s.name: s for s in load_sources_config(CONFIG).sources}
 
 
-@pytest.fixture
-def scoped(settings, tmp_path) -> Settings:
-    """The real settings, with a data dir under tmp_path.
+def _enabled(sources) -> list:
+    return [config for config in sources.values() if config.enabled]
 
-    Same type, same derived paths -- including ``manifest_path_for`` -- so the
+
+def _scoped(settings: Settings, data_dir: Path) -> Settings:
+    """The real settings, pointed at a temp dir.
+
+    Same type and same derived paths -- including ``manifest_path_for`` -- so the
     test exercises the CLI's own layout rather than a parallel one, without
     reading or writing the repo's ``data/``.
     """
-    return settings.model_copy(update={"data_dir": tmp_path / "data", "reports_dir": tmp_path / "reports"})
+    return settings.model_copy(update={"data_dir": data_dir, "reports_dir": data_dir.parent / "reports"})
 
 
 def _sync(config, settings: Settings):
@@ -4945,62 +4965,58 @@ def _sync(config, settings: Settings):
     return documents, report
 
 
-def _enabled(sources):
-    return [config for config in sources.values() if config.enabled]
+def _sync_all(configs, settings: Settings):
+    return {config.name: _sync(config, settings) for config in configs}
 
 
-def test_two_sources_yield_at_least_400_documents(scoped, sources):
+@pytest.fixture(scope="module")
+def synced(settings, sources, tmp_path_factory):
+    """Both sources, one first run, shared by the tests below.
+
+    Syncing per test downloaded the two corpora seven times over (~5250 requests,
+    measured 9m40s) to observe an upstream state that cannot differ within a
+    single run. The sources still share one ``raw_root``, in config order -- that
+    is the CLI's own shape, and the reason a cross-source deletion is visible
+    here at all (`test_one_source_never_deletes_another_sources_documents` in
+    test_fetch_corpus_cli.py pins the same interaction on stubs).
+    """
+    scoped = _scoped(settings, tmp_path_factory.mktemp("corpus"))
+    return _sync_all(_enabled(sources), scoped)
+
+
+def test_two_sources_yield_at_least_400_documents(synced):
     total = 0
-    for config in _enabled(sources):
-        documents, report = _sync(config, scoped)
-
+    for name, (documents, report) in synced.items():
         # A first run has nothing to delete. Counting a deletion here means a
         # source looked at another source's baseline (or its own stray files).
-        assert report.deleted == 0, f"{config.name} deleted {report.deleted} on a first run"
-        assert len(report.failed) <= MAX_FAILURE_RATE * report.discovered, f"{config.name}: {report.failed[:5]}"
+        assert report.deleted == 0, f"{name} deleted {report.deleted} on a first run"
+        assert len(report.failed) <= MAX_FAILURE_RATE * report.discovered, f"{name}: {report.failed[:5]}"
         total += len(documents)
 
     assert total >= 400, f"only {total} documents"
 
 
-def test_second_run_skips_everything(scoped, sources):
-    """Idempotence -- the property the scheduled task depends on."""
-    for config in _enabled(sources):
-        _sync(config, scoped)
-
-    for config in _enabled(sources):
-        _, second = _sync(config, scoped)
-
-        assert second.added == 0, f"{config.name} re-added {second.added}"
-        assert second.updated == 0, f"{config.name} re-fetched {second.updated} as changed"
-        assert second.deleted == 0, f"{config.name} deleted {second.deleted}"
-        # Every discovered page is either unchanged or explained by a failure.
-        assert second.skipped + len(second.failed) == second.discovered
-
-
-def test_every_failure_names_a_reason_we_expect(scoped, sources):
+def test_every_failure_names_a_reason_we_expect(synced):
     """The report is where a loss belongs; it must never be unexplained."""
-    for config in _enabled(sources):
-        _, report = _sync(config, scoped)
-
+    for name, (_, report) in synced.items():
         for failure in report.failed:
-            assert "404" in failure["error"] or "unexpected content type" in failure["error"], failure
+            assert "404" in failure["error"] or "unexpected content type" in failure["error"], (
+                f"{name}: {failure}"
+            )
 
 
-def test_no_html_page_is_ingested(scoped, sources):
+def test_no_html_page_is_ingested(synced):
     """langchain serves sixteen `.md` URLs as `text/html`.
 
     Four of those embed a per-request CSRF token, so before this guard they
     were also the reason a second run could never report zero changes.
     """
-    for config in _enabled(sources):
-        documents, _ = _sync(config, scoped)
-
+    for name, (documents, _) in synced.items():
         for document in documents:
-            assert not document.content.lstrip().startswith("<!DOCTYPE"), document.url
+            assert not document.content.lstrip().startswith("<!DOCTYPE"), f"{name}: {document.url}"
 
 
-def test_mcp_version_labelling_is_at_least_90_percent(scoped, sources):
+def test_mcp_version_labelling_is_at_least_90_percent(synced):
     """The M1 criterion, measured over the pages actually indexed.
 
     `/docs/` + `/specification/` are 252 pages: 198 dated + 54 draft. The 95
@@ -5009,15 +5025,15 @@ def test_mcp_version_labelling_is_at_least_90_percent(scoped, sources):
     they cannot dilute the figure. `draft` is a real version channel and counts
     as labelled.
     """
-    _, report = _sync(sources["mcp"], scoped)
+    _, report = synced["mcp"]
 
     assert report.versions["dated"] + report.versions["draft"] >= 0.9 * report.discovered
     assert report.discovered >= 240
 
 
-def test_mcp_covers_every_published_spec_version(scoped, sources):
+def test_mcp_covers_every_published_spec_version(synced):
     """Version-aware retrieval is only meaningful if the versions are all there."""
-    documents, _ = _sync(sources["mcp"], scoped)
+    documents, _ = synced["mcp"]
 
     versions = {document.version for document in documents}
 
@@ -5025,7 +5041,7 @@ def test_mcp_covers_every_published_spec_version(scoped, sources):
     assert "draft" in versions
 
 
-def test_langchain_recursion_expands_the_python_index(scoped, sources):
+def test_langchain_recursion_expands_the_python_index(synced):
     """Recursion reaches the topic sub-indexes, not just the top-level one.
 
     2026-09-22: 539 discovered -- 369 from `/oss/python/llms.txt` plus seven
@@ -5034,14 +5050,14 @@ def test_langchain_recursion_expands_the_python_index(scoped, sources):
     observed count: this asserts that recursion happened, not how big the
     corpus is on any given day.
     """
-    documents, report = _sync(sources["langgraph"], scoped)
+    documents, report = synced["langgraph"]
 
     assert len(documents) >= 350
     assert report.versions["unknown"] == len(documents)  # the corpus carries no versions
 
 
-def test_mcp_documents_are_real_markdown_with_titles(scoped, sources):
-    documents, _ = _sync(sources["mcp"], scoped)
+def test_mcp_documents_are_real_markdown_with_titles(synced):
+    documents, _ = synced["mcp"]
     sample = [d for d in documents if "/specification/2026-07-28/" in d.url]
 
     assert sample, "no 2026-07-28 specification pages retrieved"
@@ -5051,14 +5067,33 @@ def test_mcp_documents_are_real_markdown_with_titles(scoped, sources):
         assert len(document.content) > 500, f"suspiciously short: {document.url}"
         # the per-page navigation banner must be gone from every page
         assert "Documentation Index" not in document.content, document.url
+
+
+def test_second_run_skips_everything(settings, sources, tmp_path):
+    """Idempotence -- the property the scheduled task depends on.
+
+    Deliberately not the shared fixture: two consecutive runs against one data
+    dir *is* the property, so it owns its corpus rather than borrowing a
+    baseline someone else established.
+    """
+    scoped = _scoped(settings, tmp_path / "data")
+    configs = _enabled(sources)
+    _sync_all(configs, scoped)
+
+    for name, (_, second) in _sync_all(configs, scoped).items():
+        assert second.added == 0, f"{name} re-added {second.added}"
+        assert second.updated == 0, f"{name} re-fetched {second.updated} as changed"
+        assert second.deleted == 0, f"{name} deleted {second.deleted}"
+        # Every discovered page is either unchanged or explained by a failure.
+        assert second.skipped + len(second.failed) == second.discovered
 ```
 
 - [ ] **Step 2: 跑验收测试**
 
 Run: `uv run pytest -m network -v`
-Expected: `8 passed`（**实测 9 分 40 秒**。计划原文记「1–3 分钟」——那是 6 条测试时的估算，偏了近一个量级：
-8 条各自用独立的 tmp 目录、没有缓存复用，合计约 5000 次请求。**嫌慢就把 fixtures 提到 module 作用域**
-（每条源只抓一次，约 6 分钟），但那会让 `test_second_run_skips_everything` 的两次全量跑没法省。）
+Expected: `8 passed`（**实测 4 分 57 秒**。计划原文记「1–3 分钟」，那是 6 条测试时的估算。
+最初「每条测试各自抓」的写法实测 **9 分 40 秒 / 约 5250 次请求**，改成共享 fixtures 后 **297 秒 / 约 2370 次**——
+详见下面 ⚠️ 里的取舍。）
 
 - [ ] **Step 3: 真实抓取一回，留下证据**
 
@@ -5164,7 +5199,10 @@ git commit -m "test(m1): 真实语料验收 — ≥400 篇 + 版本标注率 + �
 
 - [ ] **Step 3: README 增加 Progress 小节**
 
-在 README 的 `## Approach` 之前插入：
+> **2026-09-22 修正：README 里已经有一个 `## Progress` 小节**（在 `## Stack` 之后），本节原本要求在
+> `## Approach` 之前**插入**一个新小节——那会变成两个 Progress。改为**就地更新已有的那个**：
+> 把 Corpus pipeline 那一项勾上并写成 M1 的名字，随后补一行语料现状。
+> 下面这段代码块保留为「要表达的内容」的记录，不是逐字粘贴的对象。
 
 ```markdown
 ## Progress

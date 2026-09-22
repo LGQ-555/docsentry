@@ -257,7 +257,9 @@ sources:
   - name: mcp
     kind: llms_txt
     llms_txt: https://modelcontextprotocol.io/llms.txt
-    url_include: "/docs/"
+    url_include:
+      - /docs/
+      - /specification/
     keep_all_versions: true
 
   - name: langgraph
@@ -272,6 +274,18 @@ sources:
     path: ./data/internal_docs
     default_version: "internal-2026Q3"
 ```
+
+> **`url_include` 必须同时包含 `/specification/`**（2026-09-20 实测修正）：MCP 站点把
+> 教程放在 `/docs/`，把协议规范正文放在 `/specification/`，两者各自带日期版本段。
+> 只写 `/docs/` 会拿到 110 篇而漏掉全部 111 篇规范正文——而 2026-07-28 协议变更的
+> 证据链正在那里。
+>
+> `/seps/` 与 `/community/` 故意不收录：这两类页面本身不带版本段，收进来只会让版本
+> 标注率虚降，且对"查 API 用法"帮助有限。
+>
+> **`name` 必须是普通标识符**（`^[A-Za-z0-9][A-Za-z0-9._-]*$`，2026-09-22 补）：它同时是
+> 目录名（`raw/<name>/`）和文件名（`manifests/<name>.json`），所以 `../x` 或 `a/b` 在 load 期
+> 就被拒——与 `paths.py` 的盘符逃逸防护同类，只是提前。
 
 #### 6.1.2 `Source` 抽象（v3 核心改动）
 
@@ -782,7 +796,7 @@ LangGraph 编排层 + pipeline vs agent 消融。
 
 | 里程碑 | 截止 | 验收标准 |
 |---|---|---|
-| M1 语料层 | D3 | `Source` 抽象（llms_txt + local_dir）可用；两源 ≥400 篇 `.md`；增量更新（先插后删）可运行；抓取报告输出；MCP 版本字段非 unknown ≥90% |
+| M1 语料层 | D3 | `Source` 抽象（llms_txt + local_dir）可用；两源 ≥400 篇 `.md`（实测 774）；**每源一份 manifest**，增量更新（先插后删，含崩溃测试）可运行且跨源幂等；**非 markdown 页面按 `Content-Type` 拒收并记入失败清单**；抓取报告输出含失败清单与 `dated`/`draft`/`unknown` 三分项；**被纳入索引的 MCP 页面版本标注率 ≥90%**（实测 252 篇 → 100%：198 日期 + 54 draft） |
 | M2 切片策略 | D6 | 三种 Chunker 实现 + 测试通过 + 平均尺寸一致性检查通过 |
 | M3 检索可用 | D7 | 索引构建完成，CLI 返回带来源的检索结果 |
 | M4 生成完成 | D8 | CLI 返回带引用、版本、索引时间的答案 |
