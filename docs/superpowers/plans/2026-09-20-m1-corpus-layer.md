@@ -1893,7 +1893,7 @@ git commit -m "feat(m1): llms.txt 抓取 — 返回原始字节，异常向上�
 > | 步骤 | 值 |
 > |---|---|
 > | `LocalDirectorySource.discover()[0].locator` | `C:\Users\…\docs\a.md` |
-> | `paths.raw_relpath(locator)` | `'\Users\LGQ\…\docs\a.md'` |
+> | `paths.raw_relpath(locator)` | `'\Users\…\docs\a.md'` |
 > | `ensure_within(docs_root / 上面那个, docs_root)` | **ValueError（拒绝）** |
 >
 > 根因是一条**缝**：Step 3 决定「locator 是绝对路径」（`test_locator_is_an_absolute_path` 钉着），
