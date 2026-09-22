@@ -21,9 +21,12 @@ models/
 .vscode/
 .idea/
 
-# 报告（可重新生成，但保留 latest 以便展示）
-reports/*
-!reports/latest/
+# 报告（全部可重新生成）
+#
+# 曾写成 reports/* + !reports/latest/（"保留 latest 以便展示"）。2026-09-22 改为整体忽略：
+# latest/fetch.json 每次运行都被覆写，入库等于每跑一次抓取就多一次无意义的 diff，
+# 而 git status 还会常驻一条 ?? reports/。要展示抓取报告就用截图或摘录。
+reports/
 
 # Claude Code — 本地会话文件（权限记录、本地设置），不公开
 .claude/
