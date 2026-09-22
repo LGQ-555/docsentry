@@ -147,6 +147,25 @@ def test_load_wrong_shaped_json_raises(tmp_path):
             Manifest.load(path)
 
 
+def test_load_naive_timestamp_raises(tmp_path):
+    # A timestamp with no offset parses fine, then detonates in the first reader
+    # that does date arithmetic (`now - fetched_at`). We only ever write
+    # utcnow(), so a naive value is foreign by construction -- reject it at the
+    # boundary, where the fault is still attributable to a file.
+    path = tmp_path / "manifest.json"
+    path.write_text(
+        json.dumps(
+            {"https://x/a.md": {"content_hash": "h", "version": "draft", "fetched_at": "2020-01-01T00:00:00"}}
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ManifestUnreadable, match="unreadable") as excinfo:
+        Manifest.load(path)
+
+    assert "no timezone" in excinfo.value.reason
+
+
 def test_load_io_failure_raises(tmp_path):
     # A directory where the file should be: "I cannot read this", not "absent".
     # Windows raises PermissionError here where POSIX raises IsADirectoryError

@@ -67,10 +67,20 @@ class ManifestEntry:
 
     @classmethod
     def from_json(cls, raw: dict[str, Any]) -> ManifestEntry:
+        fetched_at = datetime.fromisoformat(raw["fetched_at"])
+        if fetched_at.tzinfo is None:
+            # An offset-less timestamp parses fine and then detonates in the
+            # first reader that does date arithmetic -- the health check's
+            # `now - fetched_at` raised "can't subtract offset-naive and
+            # offset-aware datetimes". We only ever write ``utcnow()``, so a
+            # naive value is foreign by construction, and rejecting it here
+            # turns a distant traceback into an unreadable manifest, which
+            # callers already know how to handle.
+            raise ValueError(f"fetched_at {raw['fetched_at']!r} has no timezone")
         return cls(
             content_hash=raw["content_hash"],
             version=raw["version"],
-            fetched_at=datetime.fromisoformat(raw["fetched_at"]),
+            fetched_at=fetched_at,
         )
 
 
