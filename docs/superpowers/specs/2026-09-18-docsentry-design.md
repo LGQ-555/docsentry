@@ -146,7 +146,7 @@ evaluation/     评测                  →  评测集、跑分、报告
 configs/sources.yaml
     ↓  scripts/fetch_corpus.py（Source.discover → Converter.convert）
 data/raw/<source>/**.md                 （原始文件）
-data/manifest.json                      （URL → {content_hash, version, fetched_at}）
+data/manifests/<source>.json            （URL → {content_hash, version, fetched_at}，每源一份）
     ↓  变更检测 + 版本提取
 data/corpus.jsonl                       （Document 列表）
     ↓  scripts/build_index.py（调用 Chunker）
@@ -294,6 +294,14 @@ sources:
 
 **推论**：如果用户的文档在本地目录里，就不该"上传"，而应该注册一个 `local_dir` 源。索引流程每次重扫该目录，内容变了自然被 hash 检测到。
 
+**源的承诺是有边界的：它兑现「重新读取指针」，不兑现「内容和上次一样，或和你要的格式一样」。**（2026-09-22 实测补记）
+`docs.langchain.com` 的 `llms.txt` 列着 16 条 `.md` 链接，但站点对它们返回 `200 text/html`——SDK
+reference 转储、changelog、academy 落地页，站点根本没有这些页面的 markdown 版本。照单全收的后果是
+语料里混进 13.4 MB 的应用外壳，**占全部正文字节的 48%**，而语料是"按 Markdown 构造"的；其中 4 条还内嵌
+per-request CSRF token，字节每次都变，于是幂等性也永远不成立。
+**因此 `Fetched` 把服务器的 `Content-Type` 一起带上来，由管线（不是源）决定收不收**：不是 markdown 就
+记为一次失败——写进报告的失败清单，和 404 并列。丢弃是诚实的：这些页面确实不以 markdown 提供。
+
 **因此明确不做常驻文件监控**（watchdog）：索引是定期/手动触发的批处理，每次触发时重扫目录即可，无需常驻进程。**更简单，且足够。**
 
 #### 6.1.3 `llms.txt` 递归解析
@@ -304,10 +312,27 @@ sources:
 4. 收集 `.md` 结尾条目；目录项（以 `/` 结尾）跳过
 5. **同一文件内两种形态可能并存，按文件二选一是错的**：`docs.langchain.com` 顶层既有 58 个 `llms.txt` 子索引（`### Section indexes` 下），又有 119 条直连 `.md`（散在 `## Docs` / `## Open source` / `## LangSmith Fleet` / `## Agent Server API`），两条路都要走
 6. **按 URL 去重后再交给上层**：MCP 的 `llms.txt` 实测 352 条链接 / 347 唯一
+7. **索引会列站点并不以 markdown 提供的页面**（2026-09-22 实测）：LangChain 的 539 条 `.md` 里 16 条
+   实际返回 `200 text/html`。**递归解析照常收下它们**——解析器只看 URL 形态；格式的裁决在抓取层，
+   见 §6.1.2 的 `Content-Type` 拒收。
+
+**子索引会重组**：上表第 5 条记的"58 个子索引 + 119 条直连"是 2026-09-20 的观测。2026-09-22 再测时，
+`/oss/python/` 已从一个大索引拆成 8 个平级子索引（`/oss/python/llms.txt` 369 条 + concepts 4 +
+contributing 8 + deepagents 40 + langchain 76 + langgraph 43 + migrate 4 + releases 3，去重后 539）。
+**递归展开因此必须按结构做，不能按"当初那份索引长什么样"做**——这也是为什么 M1 的验收测试断言的是
+"递归发生过"而不是"总数等于 369"。
 
 #### 6.1.4 增量更新（v3 修正为"先插后删"）
 
-**变更检测**：`data/manifest.json` 记录每个 locator 的 `content_hash` / `version` / `fetched_at`。
+**变更检测**：`data/manifests/<source>.json` 记录**该源**每个 locator 的 `content_hash` / `version` / `fetched_at`。
+
+**每个源一份，不共用。**（2026-09-22 实测修正）manifest 不只是"我们有什么"的缓存，它同时是**删除基线**
+（`vanished = manifest 记得的 locator - 本次发现的 locator`）。一份共享的文件会让每个源都把别人的页面
+读成"已消失"：删掉它们的条目、把别人的页数记成 `deleted`，而因为这些条目没了，下一次运行又把它们当成
+全新页面重新写入。实测两源共用一份时，第二次运行报 `mcp added=252 deleted=538` /
+`langgraph added=538 deleted=252`，两者**都永远不幂等**，且 manifest 最终只剩最后一个源的条目
+（`health.py` 因此只能看到一半语料）。raw 文件本身是安全的——`_forget` 推出的路径在对方源的子树下，
+那儿什么都没有——**被毁的是记录，不是数据**，所以这个缺陷不会自己暴露。
 
 ```
 Source.discover()

@@ -1211,11 +1211,19 @@ from docsentry.models import DocRef, SourceKind
 
 @dataclass
 class Fetched:
-    """Raw bytes for one reference, plus when they were retrieved."""
+    """Raw bytes for one reference, plus when they were retrieved.
+
+    ``content_type`` is the server's own claim about those bytes -- the HTTP
+    ``Content-Type`` header, or ``None`` for a source with no server to ask
+    (``local_dir`` reads files). It is carried because a source can be told to
+    expect Markdown and be handed an HTML page with a 200; the pipeline decides
+    what it will ingest, and it needs the claim to decide with.
+    """
 
     ref: DocRef
     data: bytes
     fetched_at: datetime
+    content_type: str | None = None
 
 
 @runtime_checkable
@@ -1841,10 +1849,19 @@ Expected: FAIL — `NotImplementedError` on every fetch test
         """
         response = self.client.get(ref.locator)
         response.raise_for_status()
-        return Fetched(ref=ref, data=response.content, fetched_at=utcnow())
+        return Fetched(
+            ref=ref,
+            data=response.content,
+            fetched_at=utcnow(),
+            content_type=response.headers.get("content-type"),
+        )
 ```
 
 `utcnow` 在 Task 7 已随 import 引入，无需改动 import 区。
+
+> **2026-09-22 追补：`content_type` 是抓取层新增的一条契约**（触发点见 Task 17 的 ⚠️ C）。
+> 站点可以对一条 `.md` URL 回 200 却给 HTML；把服务器的原话带上去，管线才裁得动。
+> 配套测试两条（`tests/test_llms_txt_fetch.py`）：有 header 时如实带上、没有时是 `None`。
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -2944,6 +2961,14 @@ git commit -m "feat(m1): 抓取报告 — 失败清单 + 版本三分项"
 
 > 本任务只做**插入阶段**，删除阶段在 Task 14。分开是因为 Task 14 要验证的「先插后删」顺序是本里程碑的核心主张，值得独立测试。
 
+> **2026-09-22 追补：`_try_fetch` 多了一道格式闸门，`FakeSource` 跟着多一个 `content_types` 参数。**
+> 触发点是 Task 17 第一次联网实测（见那里 ⚠️ C）：站点会对 `.md` URL 回 `200 text/html`。
+> 闸门本身的完整来龙去脉写在 Task 17 的 ⚠️ 里；这里只记「本任务的代码块已经变了」这件事，
+> 以及配套的 3 条测试（`test_page_that_is_not_markdown_is_recorded_as_failed`、
+> `test_page_that_is_not_markdown_is_not_written_or_remembered`、
+> `test_only_markdown_content_types_are_accepted`，其中第三条同时钉住「`None` 放行、`text/plain` 不放行」）。
+> **测试计数 17 → 20**。
+
 > **⚠️ Step 1 的夹具有两处缺陷，Step 3 的实现本身无误；另有 3 条契约没被任何测试钉住（2026-09-21 实测，已修）**
 > 实测：计划 14 条在 scratch 里**只过 8 条**。逐条定位后，两条根因都在夹具，修完夹具 14/14 全绿。
 >
@@ -3372,9 +3397,38 @@ def _fetch_all(source: Source, refs: list[DocRef], workers: int, report: SourceR
 
 def _try_fetch(source: Source, ref: DocRef) -> tuple[DocRef, Fetched | None, str | None]:
     try:
-        return ref, source.fetch(ref), None
+        fetched = source.fetch(ref)
     except Exception as exc:  # noqa: BLE001 -- any per-page failure is reportable, not fatal
         return ref, None, f"{type(exc).__name__}: {exc}"
+    unexpected = _unexpected_format(fetched)
+    if unexpected is not None:
+        return ref, None, unexpected
+    return ref, fetched, None
+
+
+# Every ``.md`` URL in both corpora answers with one of these. docs.langchain.com
+# serves ``200 text/html`` for sixteen of the URLs its index still lists
+# (reference dumps, changelogs, the academy landing page) -- pages it does not
+# publish as Markdown at all. ``text/plain`` is deliberately absent: it is not a
+# markdown claim, and a corpus that serves .md that way should show up in the
+# failure list rather than be guessed at.
+_MARKDOWN_TYPES = frozenset({"text/markdown", "text/x-markdown"})
+
+
+def _unexpected_format(fetched: Fetched) -> str | None:
+    """The reason these bytes are not what the source asked for, or ``None``.
+
+    A page rejected here is never written and never remembered, so it cannot
+    become a phantom document -- and it is reported like any other failure, which
+    is where a loss belongs. ``content_type`` of ``None`` (a source with no
+    server to ask) means no claim to check against.
+    """
+    if fetched.content_type is None:
+        return None
+    media_type = fetched.content_type.split(";", 1)[0].strip().lower()
+    if media_type in _MARKDOWN_TYPES:
+        return None
+    return f"unexpected content type: {fetched.content_type}"
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
@@ -3738,6 +3792,45 @@ git commit -m "feat(m1): 先插后删 — 崩溃时留下冗余而非索引空�
 >
 > 测试 5 → 8（补 1 条修法测试 + 2 条守卫）。
 
+> **⚠️ 一个源会删掉另一个源的文档：manifest 被当成「属于单个源」，而 CLI 让它跨源共享（2026-09-22 实测，已修）**
+>
+> **根因**：`sync_source` 里 `vanished = sorted(manifest.locators() - discovered)` 拿到的是**整个** manifest，
+> 不是本源的子集；而 CLI 只 load 一份、传给每个源。于是第二个源跑的时候，第一个源的全部 locator 都落进
+> `vanished`。`_forget` 用 `docs_root / raw_relpath(locator)` 推路径——**这个路径按构造必然在 `docs_root` 内**
+> （`docs_root` 是拼在前面的），所以 `ensure_within` 不会拒绝；那儿没有文件，`unlink(missing_ok=True)`
+> 于是「成功」，`gone=True`，**manifest 条目被删掉**。
+>
+> **实测（最小复现：两个源、一份 manifest、一个 raw_root，正是 CLI 的形状）**
+>
+> | 断言 | 结果 |
+> |---|---|
+> | 第二个源不删第一个源的文档 | **失败** —— `deleted` 计了对方的 |
+> | 两源跨两次运行保持幂等 | **失败** —— `added=1, skipped=0`，重新「新增」了一遍 |
+> | 第一个源的 **raw 文件**存活 | 通过 ✓ |
+>
+> **raw 文件是安全的**（对方源的子树下什么都没有），被毁的是 manifest。所以严重性不是数据丢失，而是：
+> ① **幂等性完全失效**（只要 ≥2 个源，每次运行两个源都报全量 churn —— 实测第二次运行
+> `mcp added=252 deleted=538` / `langgraph added=538 deleted=252`）；② **manifest 永远只剩最后一个源的
+> 条目**，而 `health.py` 读的就是它，于是健康检查只能看到一半语料；③ `report.deleted` 在**说谎**
+> （实测 langgraph 报 `deleted=252`，实际删掉 0 个字节）。
+>
+> **为什么 177 条测试一条都没抓到**：所有 `sync_source` 测试都只同步**一个**源（跨运行共享 manifest，
+> 从不跨源共享），本任务的 CLI 测试配置里也只有一个源。**Task 17 是第一个让两个源共用一个 manifest 的
+> 测试**——又一次「各自绿 ≠ 组合起来对」，与 Task 9/13 的 local_dir locator 同一形状。
+>
+> **修法**：**每个源一份 manifest**，`data/manifest.json` → `data/manifests/<source>.json`。
+> `pipeline.py` 一行不改（`vanished` 天然正确），key 空间也天然按源隔离（两个源都有 `notes/a.md` 也不会撞）。
+> `Settings.manifest_path` → `manifests_dir` + `manifest_path_for(name)`；`health.py` 默认合并整个目录
+> （见 Task 16）；设计文档 §4.2 / §6.1.4 已同步。Step 3 的代码见下。
+>
+> **顺带**：源名现在同时是目录名（`raw/<name>/`）和文件名（`manifests/<name>.json`），所以在 `SourceConfig`
+> 里加了路径段校验（`^[A-Za-z0-9][A-Za-z0-9._-]*`，拒 `../x`、`a/b`、空串），与 `paths.py` 的盘符逃逸同一类
+> 防护，只是提前到 load 期。`tests/test_config.py` 有 5 条参数化用例钉它。
+>
+> **测试计数 8 → 10**（补 `test_one_source_never_deletes_another_sources_documents`、
+> `test_two_sources_are_idempotent_across_runs`）；`test_damaged_manifest_exits_with_an_actionable_message`
+> 的路径改为 `data/manifests/one.json`，断言的文件名随之改为 `one.json`。
+
 - [ ] **Step 1: 写失败测试**
 
 ```python
@@ -3755,6 +3848,16 @@ sources:
   - name: one
     kind: llms_txt
     llms_txt: https://x/llms.txt
+"""
+
+TWO_SOURCE_CONFIG = """
+sources:
+  - name: alpha
+    kind: llms_txt
+    llms_txt: https://alpha.example.com/llms.txt
+  - name: beta
+    kind: llms_txt
+    llms_txt: https://beta.example.com/llms.txt
 """
 
 
@@ -3879,6 +3982,175 @@ def test_missing_config_exits_nonzero(tmp_path):
     result = runner.invoke(app, ["--config", str(tmp_path / "nope.yaml"), "--data-dir", str(tmp_path / "data")])
 
     assert result.exit_code != 0
+
+
+# --- the CLI's own promises, and Task 11's debt to it ----------------------
+#
+# One stub factory for the three tests below: they each need a *working* source
+# (the five tests above carry their own copy, since each one stubs a different
+# shape of answer).
+
+
+def _stub(locators=("https://x/docs/2026-07-28/a.md",), body=b"# A\nbody\n"):
+    from docsentry.corpus.sources.base import Fetched
+    from docsentry.models import DocRef, SourceKind, utcnow
+
+    class StubSource:
+        name = "one"
+        kind = SourceKind.LLMS_TXT
+
+        def discover(self):
+            return [
+                DocRef(source="one", kind=self.kind, locator=locator, title="A")
+                for locator in locators
+            ]
+
+        def fetch(self, ref):
+            return Fetched(ref=ref, data=body, fetched_at=utcnow())
+
+        def refreshable(self):
+            return True
+
+    return StubSource()
+
+
+def _invoke(tmp_path, monkeypatch, **stub_kwargs):
+    import scripts.fetch_corpus as cli
+
+    monkeypatch.setattr(cli, "build_source", lambda config, settings: _stub(**stub_kwargs))
+    return runner.invoke(
+        app,
+        [
+            "--config", str(_write_config(tmp_path)),
+            "--data-dir", str(tmp_path / "data"),
+            "--reports-dir", str(tmp_path / "reports"),
+        ],
+    )
+
+
+def test_damaged_manifest_exits_with_an_actionable_message(tmp_path):
+    """Task 11's debt: an unreadable manifest must not reach the user as a traceback."""
+    data = tmp_path / "data"
+    (data / "manifests").mkdir(parents=True)
+    (data / "manifests" / "one.json").write_text("{not json", encoding="utf-8")
+
+    result = runner.invoke(
+        app,
+        [
+            "--config", str(_write_config(tmp_path)),
+            "--data-dir", str(data),
+            "--reports-dir", str(tmp_path / "reports"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "one.json" in result.output  # which file
+    assert "delete" in result.output  # and what to do about it
+    assert "Traceback" not in result.output
+
+
+def test_second_run_is_a_no_op(tmp_path, monkeypatch):
+    """The property the health check and the scheduled task both depend on."""
+    assert _invoke(tmp_path, monkeypatch).exit_code == 0
+
+    assert _invoke(tmp_path, monkeypatch).exit_code == 0
+
+    payload = json.loads((tmp_path / "reports" / "latest" / "fetch.json").read_text(encoding="utf-8"))
+    counts = payload["sources"][0]
+    assert (counts["added"], counts["updated"], counts["skipped"]) == (0, 0, 1)
+
+
+def test_corpus_jsonl_is_sorted_and_leaves_no_temp_file(tmp_path, monkeypatch):
+    """Sorted by doc_id for reproducible diffs; written atomically."""
+    from docsentry.models import make_doc_id
+
+    result = _invoke(tmp_path, monkeypatch, locators=("https://x/z.md", "https://x/a.md"))
+
+    assert result.exit_code == 0, result.output
+    lines = (tmp_path / "data" / "corpus.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    ids = [json.loads(line)["doc_id"] for line in lines]
+    assert ids == sorted(ids)
+    assert ids[0] == make_doc_id("one", "https://x/a.md")  # handed back z first
+    assert list((tmp_path / "data").glob("*.tmp")) == []
+
+
+# --- two sources in one run ------------------------------------------------
+#
+# The deletion baseline is per-source, so one shared manifest makes each source
+# see the others' locators as vanished. Every other test here syncs a single
+# source, which is exactly why this went unnoticed until the M1 acceptance run.
+
+
+def _pages(name, locator):
+    from docsentry.corpus.sources.base import Fetched
+    from docsentry.models import DocRef, SourceKind, utcnow
+
+    class StubSource:
+        kind = SourceKind.LLMS_TXT
+
+        def __init__(self):
+            self.name = name
+
+        def discover(self):
+            return [DocRef(source=name, kind=self.kind, locator=locator, title=name)]
+
+        def fetch(self, ref):
+            return Fetched(ref=ref, data=f"# {name}\nbody\n".encode(), fetched_at=utcnow())
+
+        def refreshable(self):
+            return True
+
+    return StubSource()
+
+
+def _invoke_two_sources(tmp_path, monkeypatch):
+    import scripts.fetch_corpus as cli
+
+    stubs = {
+        "alpha": _pages("alpha", "https://alpha.example.com/docs/a.md"),
+        "beta": _pages("beta", "https://beta.example.com/docs/b.md"),
+    }
+    monkeypatch.setattr(cli, "build_source", lambda config, settings: stubs[config.name])
+    return runner.invoke(
+        app,
+        [
+            "--config", str(_write_config(tmp_path, TWO_SOURCE_CONFIG)),
+            "--data-dir", str(tmp_path / "data"),
+            "--reports-dir", str(tmp_path / "reports"),
+        ],
+    )
+
+
+def _counts(tmp_path):
+    payload = json.loads((tmp_path / "reports" / "latest" / "fetch.json").read_text(encoding="utf-8"))
+    return {source["name"]: source for source in payload["sources"]}
+
+
+def test_one_source_never_deletes_another_sources_documents(tmp_path, monkeypatch):
+    result = _invoke_two_sources(tmp_path, monkeypatch)
+
+    assert result.exit_code == 0, result.output
+    counts = _counts(tmp_path)
+    assert counts["alpha"]["added"] == 1
+    assert counts["beta"]["added"] == 1
+    # Nothing has vanished from either source on a first run.
+    assert counts["alpha"]["deleted"] == 0, "alpha's documents were counted as vanished during beta's sync"
+    assert counts["beta"]["deleted"] == 0
+
+
+def test_two_sources_are_idempotent_across_runs(tmp_path, monkeypatch):
+    """The scheduled task's premise, which only holds if the baselines are separate."""
+    _invoke_two_sources(tmp_path, monkeypatch)
+
+    result = _invoke_two_sources(tmp_path, monkeypatch)
+
+    assert result.exit_code == 0, result.output
+    for name, counts in _counts(tmp_path).items():
+        assert (counts["added"], counts["updated"], counts["deleted"]) == (0, 0, 0), (
+            f"{name} churned on a second run: {counts}"
+        )
+        assert counts["skipped"] == counts["discovered"] == 1
+
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -3913,7 +4185,7 @@ import typer
 
 from docsentry.config import Settings, SourceConfig, load_sources_config
 from docsentry.corpus.converters.markdown import MarkdownConverter
-from docsentry.corpus.manifest import Manifest
+from docsentry.corpus.manifest import Manifest, ManifestUnreadable
 from docsentry.corpus.pipeline import sync_source
 from docsentry.corpus.report import FetchReport, SourceReport
 from docsentry.corpus.sources.llms_txt import LlmsTxtSource
@@ -3992,10 +4264,27 @@ def main(
             typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
             raise typer.Exit(code=2)
 
-    if full:
-        manifest = Manifest()  # empty manifest == everything looks new
-    else:
-        manifest = Manifest.load(settings.manifest_path)
+    # One manifest per source, all loaded before anything is fetched: a damaged
+    # baseline should abort the whole run rather than half of it. Sharing one
+    # file across sources would make each source read the others' locators as
+    # vanished -- see Settings.manifest_path_for.
+    manifests: dict[str, Manifest] = {}
+    for source_config in selected:
+        if full:
+            manifests[source_config.name] = Manifest()  # empty == everything looks new
+            continue
+        try:
+            manifests[source_config.name] = Manifest.load(settings.manifest_path_for(source_config.name))
+        except ManifestUnreadable as exc:
+            # Aborting beats pretending the file was absent: the manifest is
+            # also the deletion baseline, so rebuilding it quietly costs more
+            # than the re-fetch it saves (see the manifest module's docstring).
+            typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+            typer.secho(
+                f"       delete {exc.path} to rebuild it from scratch: every page is then re-fetched.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
 
     started = utcnow()
     clock = time.perf_counter()
@@ -4012,14 +4301,15 @@ def main(
                 source=live,
                 converter=MarkdownConverter(),
                 raw_root=settings.raw_dir,
-                manifest=manifest,
+                manifest=manifests[source_config.name],
                 report=source_report,
                 workers=settings.fetch_workers,
             )
         )
         reports.append(source_report)
 
-    manifest.save(settings.manifest_path)
+    for name, source_manifest in manifests.items():
+        source_manifest.save(settings.manifest_path_for(name))
     write_corpus(settings.corpus_path, documents)
 
     report = FetchReport(started_at=started, duration_s=time.perf_counter() - clock, sources=reports)
@@ -4132,7 +4422,31 @@ git commit -m "feat(m1): fetch_corpus CLI — 增量更新 + 报告落盘"
 > 两条守卫各钉一个已经咬过人的事实：截断 JSON（不许谎报成 `no manifest` + 退出码 2 + 输出含路径）、
 > 非 UTF-8 字节（`UnicodeDecodeError ⊂ ValueError`，**不是** `OSError`）。
 >
-> **测试计数：7 → 9**（原计划的 7 无误，2 条是新增守卫；Step 4 的预期同步改为 `9 passed`）。
+> **④ 这个脚本没有 `__main__` 入口，`uv run scripts/health.py` 是一句静默空操作
+> （2026-09-22 首次真跑时实测，已修）**
+>
+> Step 3 的代码块结束于 `main()` 函数体，**没有** `if __name__ == "__main__": app()` ——
+> 而 `fetch_corpus.py` 有。于是被 `python scripts/health.py` 直接执行时，模块把 `app` 定义出来就退出了：
+> **exit code 0、stdout 空、stderr 空**。实测即 `CompletedProcess(returncode=0, stdout='', stderr='')`。
+>
+> 这正是 Task 17 Step 5 唯一写下的调用方式（`uv run scripts/health.py`），也是用户唯一会敲的那条命令。
+> **一个健康检查静默地什么都不做**——它存在的理由恰恰是消灭这种失败。
+>
+> **为什么上面 9 条测试全都看不见它**：它们都走 `CliRunner.invoke(app, [...])`，直接调用 Typer 应用对象，
+> **从不需要模块本身可执行**。「测试全绿 ≠ 那个产物能用」，这是本项目第二次栽在这条上。
+>
+> **修法**：补上 `__main__` 入口。**并补 3 条测试**，直接跑进程而不经过 `CliRunner`：
+> ① `test_every_script_has_a_command_line_entry_point`（参数化扫 `scripts/*.py`，以 `--help` 验证可执行性——
+> 以后新增脚本自动被覆盖）、② `test_health_script_reports_when_run_as_documented`（按文件里写的那条命令真跑，
+> 断言输出含 `documents: 1`）。第 ③ 条是 `merge_manifests` 的行为：一个源损坏时**整次合并中止**，
+> 不能悄悄跳过它（`test_cli_aborts_on_any_unreadable_manifest_not_just_the_first`）。
+>
+> **同时 `health.py` 的默认读取对象变了**：manifest 改成每源一份（见 Task 15 的 ⚠️），所以默认读
+> `data/manifests/` 下所有文件并合并（`merge_manifests`），`--manifest <file>` 保持"只看这一个文件"的语义
+> ——上面 6 条走 `--manifest` 的测试因此逐字节不变。
+>
+> **测试计数：7 → 9 → 14**（③ 加 2 条守卫；④ 加 2 条合并 + 3 条可执行性，其中 1 条按脚本参数化出 2 个用例）。
+> Step 4 的预期同步改为 **`14 passed`**。
 >
 > 三处改动都已离线实测（scratch 里跑计划代码 + 计划测试，只改 import）：计划那 4 条 CLI 测试
 > 在改后**逐字节不变地通过**，9 条全绿。**实现落地时直接按上面的代码块抄**——repo 里的
@@ -4143,14 +4457,21 @@ git commit -m "feat(m1): fetch_corpus CLI — 增量更新 + 报告落盘"
 ```python
 # tests/test_health.py
 import json
+import os
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from docsentry.corpus.manifest import Manifest, ManifestEntry
 from scripts.health import app, stale_documents
 
 runner = CliRunner()
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 NOW = datetime(2026, 9, 20, 12, 0, tzinfo=timezone.utc)
 
@@ -4248,6 +4569,38 @@ def test_cli_handles_missing_manifest(tmp_path):
     assert "no manifest" in result.output.lower()
 
 
+def test_cli_merges_every_source_manifest(tmp_path, monkeypatch):
+    """One manifest per source, so the default view is all of them together."""
+    data = tmp_path / "data"
+    manifests = data / "manifests"
+    manifests.mkdir(parents=True)
+    (manifests / "mcp.json").write_text(json.dumps({"https://m/a.md": _entry("2026-07-28")}), encoding="utf-8")
+    (manifests / "langgraph.json").write_text(json.dumps({"https://l/a.md": _entry("unknown")}), encoding="utf-8")
+    monkeypatch.setenv("DOCSENTRY_DATA_DIR", str(data))
+
+    result = runner.invoke(app, ["--now", NOW.isoformat()])
+
+    assert result.exit_code == 0, result.output
+    assert "documents: 2" in result.output
+    assert "1 dated, 0 draft, 1 unknown" in result.output
+    assert "2 sources" in result.output
+
+
+def test_cli_aborts_on_any_unreadable_manifest_not_just_the_first(tmp_path, monkeypatch):
+    """Merging must not dilute the rule the guard tests below pin down."""
+    data = tmp_path / "data"
+    manifests = data / "manifests"
+    manifests.mkdir(parents=True)
+    (manifests / "a-good.json").write_text(json.dumps({"https://x/a.md": _entry()}), encoding="utf-8")
+    (manifests / "z-broken.json").write_text("{not json", encoding="utf-8")
+    monkeypatch.setenv("DOCSENTRY_DATA_DIR", str(data))
+
+    result = runner.invoke(app, ["--now", NOW.isoformat()])
+
+    assert result.exit_code == 2
+    assert "no manifest" not in result.output.lower()
+
+
 def test_cli_refuses_to_report_on_an_unreadable_manifest(tmp_path):
     # The plan's loader caught the exception and returned {} -- a corrupt
     # manifest was reported as an absent one with exit code 0, which a
@@ -4273,6 +4626,43 @@ def test_cli_refuses_on_undecodable_bytes(tmp_path):
 
     assert result.exit_code == 2
     assert "unreadable" in result.output.lower()
+
+
+# --- the command line the plan actually documents --------------------------
+#
+# Every test above calls the Typer app object through CliRunner, which never
+# needs the module to be *executable*. So all of them passed while
+# `uv run scripts/health.py` -- the invocation in the plan and the only one a
+# user types -- was a silent no-op: no `__main__` guard, exit 0, no output.
+
+SCRIPTS = sorted(path for path in (REPO_ROOT / "scripts").glob("*.py") if path.name != "__init__.py")
+
+
+@pytest.mark.parametrize("script", SCRIPTS, ids=lambda path: path.name)
+def test_every_script_has_a_command_line_entry_point(script):
+    result = subprocess.run(
+        [sys.executable, str(script), "--help"], capture_output=True, text=True, cwd=REPO_ROOT
+    )
+
+    assert result.returncode == 0, f"{script.name} is not runnable: {result.stderr}"
+    assert "usage" in result.stdout.lower()
+
+
+def test_health_script_reports_when_run_as_documented(tmp_path):
+    data = tmp_path / "data"
+    (data / "manifests").mkdir(parents=True)
+    (data / "manifests" / "one.json").write_text(json.dumps({"https://x/a.md": _entry()}), encoding="utf-8")
+
+    result = subprocess.run(
+        [sys.executable, str(REPO_ROOT / "scripts" / "health.py"), "--now", NOW.isoformat()],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        env={**os.environ, "DOCSENTRY_DATA_DIR": str(data)},
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "documents: 1" in result.stdout
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -4297,6 +4687,10 @@ explains why the distinction is load-bearing); a second, weaker parser beside
 it would report a corrupt manifest as a missing one -- which is the same
 silent-completeness failure this module exists to surface, one level up.
 
+There is one manifest per source, so the default reads and merges them all:
+the questions here are about the corpus as a whole. ``--manifest`` points at a
+single file instead, which is what the unit tests use.
+
 Unlike ``fetch_corpus``, this script never writes the manifest, so an unreadable
 one cannot cost us the deletion baseline. It aborts anyway: a health check that
 answers "nothing to report" for a file it could not read is worse than one that
@@ -4317,6 +4711,21 @@ from docsentry.corpus.versioning import version_bucket
 app = typer.Typer(add_completion=False, help="Report corpus health and staleness.")
 
 
+def merge_manifests(manifests_dir: Path) -> tuple[Manifest, str]:
+    """Every per-source manifest under ``manifests_dir``, as one view.
+
+    Locators are unique per source; should two sources ever list the same one,
+    the last file read wins, which can only misstate the reported totals.
+    """
+    paths = sorted(manifests_dir.glob("*.json")) if manifests_dir.is_dir() else []
+    merged = Manifest()
+    for path in paths:
+        for locator, entry in Manifest.load(path).items():
+            merged.set(locator, entry)
+    label = f"{manifests_dir} ({len(paths)} sources)" if paths else str(manifests_dir)
+    return merged, label
+
+
 def stale_documents(manifest: Manifest, *, max_age_days: int, now: datetime):
     """``[(locator, days_since_check, version)]`` for entries older than the limit."""
     stale = []
@@ -4334,9 +4743,11 @@ def main(
     now: str = typer.Option(None, "--now", help="Override the current time (for tests)"),
 ) -> None:
     settings = Settings()
-    path = manifest or settings.manifest_path
     try:
-        corpus_manifest = Manifest.load(path)
+        if manifest is not None:
+            corpus_manifest, label = Manifest.load(manifest), str(manifest)
+        else:
+            corpus_manifest, label = merge_manifests(settings.manifests_dir)
     except ManifestUnreadable as exc:
         typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
         typer.secho(
@@ -4347,14 +4758,14 @@ def main(
         raise typer.Exit(code=2)
 
     if not corpus_manifest:
-        typer.echo(f"no manifest at {path} -- run fetch_corpus.py first")
+        typer.echo(f"no manifest at {label} -- run fetch_corpus.py first")
         raise typer.Exit(code=0)
 
     buckets = {"dated": 0, "draft": 0, "unknown": 0}
     for _, entry in corpus_manifest.items():
         buckets[version_bucket(entry.version)] += 1
 
-    typer.echo(f"manifest: {path}")
+    typer.echo(f"manifest: {label}")
     typer.echo(f"documents: {len(corpus_manifest)}")
     typer.echo(f"versions: {buckets['dated']} dated, {buckets['draft']} draft, {buckets['unknown']} unknown")
 
@@ -4366,12 +4777,16 @@ def main(
             typer.echo(f"  {age_days:>4}d  [{version}]  {locator}")
         if len(stale) > 20:
             typer.echo(f"  ... and {len(stale) - 20} more")
+
+
+if __name__ == "__main__":
+    app()
 ```
 
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `uv run pytest tests/test_health.py -v`
-Expected: `9 passed`
+Expected: `14 passed`
 
 - [ ] **Step 5: 提交**
 
@@ -4389,10 +4804,70 @@ git commit -m "feat(m1): health 脚本 — 版本分布 + 陈旧告警"
 
 > 这是**唯一的联网测试**，默认被 `addopts` 排除。它是 M1 验收标准的可执行形式。
 
+> **⚠️ Step 1 的 `_sync` 自己造了一个 source，绕开了 CLI 用的 `build_source()`（2026-09-22 实测，已修）**
+>
+> 原代码直接 `LlmsTxtSource(name=…, llms_txt=…, url_include=…, timeout_s=…, retries=…)`，两个后果：
+>
+> - **`keep_all_versions` 没有接**。`LlmsTxtSource.__init__` 的默认值是 `True`，而 `configs/sources.yaml`
+>   里两个源恰好都是 `true`——**所以今天测不出差别**。但 `build_source()` 是 `config.keep_all_versions`
+>   **唯一**的接线处，验收测试绕开了它：只要有人把配置改成 `false`，CLI 会剪枝、验收测试照旧保留全部
+>   版本，**测试仍绿，却在对一条没人跑的管线做断言**。
+> - `_sync` 的第一个参数 `name` 完全没被使用（源名取的是 `config.name`；实测确认是死参数）。
+>
+> 这就是本项目已经付过学费的那类缝：**两个各自评审过的构造点，测试只覆盖其中一个**——Task 9/13 的
+> local_dir locator 是同一形状（见 Task 13 开头的 ⚠️）。修法：`_sync` 改调
+> `build_source(config, settings)`，调用点由 `_sync("mcp", sources["mcp"], …)` 改为
+> `_sync(sources["mcp"], …)`。**测试数不变（6）**；离线已核：收集 6 条、`build_source` 对两个源返回的
+> 属性与配置逐项一致。
+>
+> **这不改变里程碑的验证强度**：Step 3–5 会真跑 CLI 并核对控制台数字，配置接线在那里被端到端覆盖。
+> 这条修的是**测试文件本身是否忠实代表**——验收测试说「这条管线产出 621 篇」时，指的必须是 CLI 跑的那条。
+
+> **⚠️ 2026-09-22 首次联网实测（本计划此前从未真跑过联网源）：三个真缺陷 + 一次语料漂移，已全部修复并重跑通过**
+>
+> 四件事一次跑出来，**这就是这条验收测试存在的意义**。逐条：
+>
+> **A. 一个源删掉另一个源的文档。** `test_two_sources_yield_at_least_400_documents` 直接挂：
+> langgraph 的 report 里 `deleted=252`，而那 252 篇是 MCP 的。根因、复现与修法见 **Task 15 的 ⚠️**
+> 与设计文档 §6.1.4。本测试因此新增 `assert report.deleted == 0`——**首次运行本就没有东西可删**，
+> 这一条就是 A 的守卫（它今天会直接抓住回归）。
+>
+> **B. 验收测试要求上游语料完美无瑕。** 计划的 `assert not report.failed` 挂在一条 404 上：
+> `oss/python/deepagents/code-link.md` 被 LangChain 的索引列着，但站点对 `.md` 与不带 `.md` 两种形式
+> **都回 404**（实测 `curl` 确认）。而管线自己的 docstring 写的是「one 404 must not cost us the other 699
+> pages, and the report makes the loss visible」——**404 是被汇报的对象，不是系统的失败**。
+> 修法：断言改为「有界且可归因」（见下方 `MAX_FAILURE_RATE`，且每条失败必须写明原因）。
+>
+> **C. 16 篇 HTML 冒充 Markdown，占语料正文字节的 48%。** 首轮 790 篇里，`reference/*.md`、
+> `changelog-*.md`、`academy.md`、`studio.md` 共 16 篇由站点以 **`200 text/html`** 返回（真 markdown 页是
+> `text/markdown; charset=utf-8`），转换器照单全收，还把 `origin_format` 报成 `md`。两个后果：
+> ① 语料是按 Markdown 构造的，却混进 13.42 MB 的 Vercel 应用外壳；
+> ② 其中 4 篇内嵌 per-request CSRF token，**字节每次请求都变**，于是第二次运行永远报 `updated=4`——
+> **幂等性在结构上不可能成立**。
+> 修法见 Task 6 / Task 8 / Task 13 的追补：`Fetched` 带上服务器的 `Content-Type`，管线拒收非 markdown 并
+> 记为失败。修后：16 篇进失败清单，`corpus.jsonl` 774 篇（790 − 16），第二次运行
+> `added=0 updated=0 skipped=774 deleted=0` ✓。
+> **顺带**：本计划原有的 `test_documents_are_real_markdown_with_titles` 只抽样 MCP 的
+> `/specification/2026-07-28/`，所以它检查了一条源、对另一条完全失明。新增
+> `test_no_html_page_is_ingested`，扫**全部源的全部文档**。
+>
+> **D. `health.py` 没有 `__main__` 入口。** Step 5 那条命令原本是一句静默空操作（exit 0、零输出）。
+> 详见 **Task 16 的 ⚠️ ④**。
+>
+> **附：语料本身也动了**（这不是缺陷，恰是本项目研究的现象）。langgraph 从 369 篇变成 **539** 篇——
+> LangChain 把 `/oss/python/` 拆成了 8 个平级子索引（`/oss/python/llms.txt` 369 + concepts 4 +
+> contributing 8 + deepagents 40 + langchain 76 + langgraph 43 + migrate 4 + releases 3，去重后 539）。
+> 因此下面 Step 3/4/5 的期望数字**按 2026-09-22 实测重写**；且「总数」类断言一律改成**下界**——
+> 语料会变，验收标准不该跟着变。
+>
+> **测试计数 6 → 8**（补 `test_every_failure_names_a_reason_we_expect`、`test_no_html_page_is_ingested`；
+> `test_documents_are_real_markdown_with_titles` 更名为 `test_mcp_documents_are_real_markdown_with_titles`
+> 并限定到 MCP；`test_second_run_skips_everything` 的核算改为「skipped + failed == discovered」，
+> 因为失败页本来就不会被 skip）。
+
 - [ ] **Step 1: 写验收测试**
 
 ```python
-# tests/test_m1_acceptance.py
 """M1 acceptance against the real corpora.
 
 Excluded by default (see pyproject `addopts`). Run with:
@@ -4400,11 +4875,16 @@ Excluded by default (see pyproject `addopts`). Run with:
     uv run pytest -m network -v
 
 Slow by design: it downloads both corpora end to end.
+
+This is the only test that talks to the real internet, and the first live run
+(2026-09-22) is why it exists: it found that a page the site does not publish
+as Markdown was being ingested as if it were, that LangChain serves sixteen
+such pages, and that two sources sharing one manifest delete each other's
+entries. None of that was visible to the other 192 tests, which use stubs.
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -4414,11 +4894,17 @@ from docsentry.corpus.converters.markdown import MarkdownConverter
 from docsentry.corpus.manifest import Manifest
 from docsentry.corpus.pipeline import sync_source
 from docsentry.corpus.report import SourceReport
-from docsentry.corpus.sources.llms_txt import LlmsTxtSource
+from scripts.fetch_corpus import build_source
 
 pytestmark = pytest.mark.network
 
 CONFIG = Path("configs/sources.yaml")
+
+# Upstream is not perfect and neither are we entitled to assume it is: the
+# index lists pages that 404, and pages that are not served as Markdown at all
+# (design spec 6.1.2 -- a source can only promise to re-read the pointer).
+# What we do owe is that the loss is small, bounded, and *named*.
+MAX_FAILURE_RATE = 0.05
 
 
 @pytest.fixture(scope="module")
@@ -4431,40 +4917,90 @@ def sources():
     return {s.name: s for s in load_sources_config(CONFIG).sources}
 
 
-def _sync(name, config, settings, tmp_path, manifest):
-    live = LlmsTxtSource(
-        name=config.name,
-        llms_txt=config.llms_txt,
-        url_include=config.url_include,
-        timeout_s=settings.http_timeout_s,
-        retries=settings.http_retries,
-    )
+@pytest.fixture
+def scoped(settings, tmp_path) -> Settings:
+    """The real settings, with a data dir under tmp_path.
+
+    Same type, same derived paths -- including ``manifest_path_for`` -- so the
+    test exercises the CLI's own layout rather than a parallel one, without
+    reading or writing the repo's ``data/``.
+    """
+    return settings.model_copy(update={"data_dir": tmp_path / "data", "reports_dir": tmp_path / "reports"})
+
+
+def _sync(config, settings: Settings):
+    """Run one source exactly as the CLI does: its own manifest, start to finish."""
+    manifest = Manifest.load(settings.manifest_path_for(config.name))
     report = SourceReport(name=config.name, kind=config.kind)
+
     documents = sync_source(
-        source=live,
+        source=build_source(config, settings),
         converter=MarkdownConverter(),
-        raw_root=tmp_path / "raw",
+        raw_root=settings.raw_dir,
         manifest=manifest,
         report=report,
         workers=settings.fetch_workers,
     )
+    manifest.save(settings.manifest_path_for(config.name))
     return documents, report
 
 
-def test_two_sources_yield_at_least_400_documents(tmp_path, settings, sources):
-    manifest = Manifest()
+def _enabled(sources):
+    return [config for config in sources.values() if config.enabled]
+
+
+def test_two_sources_yield_at_least_400_documents(scoped, sources):
     total = 0
-    for config in sources.values():
-        if not config.enabled:
-            continue
-        documents, report = _sync(config.name, config, settings, tmp_path, manifest)
-        assert not report.failed, f"{config.name} had fetch failures: {report.failed[:5]}"
+    for config in _enabled(sources):
+        documents, report = _sync(config, scoped)
+
+        # A first run has nothing to delete. Counting a deletion here means a
+        # source looked at another source's baseline (or its own stray files).
+        assert report.deleted == 0, f"{config.name} deleted {report.deleted} on a first run"
+        assert len(report.failed) <= MAX_FAILURE_RATE * report.discovered, f"{config.name}: {report.failed[:5]}"
         total += len(documents)
 
     assert total >= 400, f"only {total} documents"
 
 
-def test_mcp_version_labelling_is_at_least_90_percent(tmp_path, settings, sources):
+def test_second_run_skips_everything(scoped, sources):
+    """Idempotence -- the property the scheduled task depends on."""
+    for config in _enabled(sources):
+        _sync(config, scoped)
+
+    for config in _enabled(sources):
+        _, second = _sync(config, scoped)
+
+        assert second.added == 0, f"{config.name} re-added {second.added}"
+        assert second.updated == 0, f"{config.name} re-fetched {second.updated} as changed"
+        assert second.deleted == 0, f"{config.name} deleted {second.deleted}"
+        # Every discovered page is either unchanged or explained by a failure.
+        assert second.skipped + len(second.failed) == second.discovered
+
+
+def test_every_failure_names_a_reason_we_expect(scoped, sources):
+    """The report is where a loss belongs; it must never be unexplained."""
+    for config in _enabled(sources):
+        _, report = _sync(config, scoped)
+
+        for failure in report.failed:
+            assert "404" in failure["error"] or "unexpected content type" in failure["error"], failure
+
+
+def test_no_html_page_is_ingested(scoped, sources):
+    """langchain serves sixteen `.md` URLs as `text/html`.
+
+    Four of those embed a per-request CSRF token, so before this guard they
+    were also the reason a second run could never report zero changes.
+    """
+    for config in _enabled(sources):
+        documents, _ = _sync(config, scoped)
+
+        for document in documents:
+            assert not document.content.lstrip().startswith("<!DOCTYPE"), document.url
+
+
+def test_mcp_version_labelling_is_at_least_90_percent(scoped, sources):
     """The M1 criterion, measured over the pages actually indexed.
 
     `/docs/` + `/specification/` are 252 pages: 198 dated + 54 draft. The 95
@@ -4473,15 +5009,15 @@ def test_mcp_version_labelling_is_at_least_90_percent(tmp_path, settings, source
     they cannot dilute the figure. `draft` is a real version channel and counts
     as labelled.
     """
-    _, report = _sync("mcp", sources["mcp"], settings, tmp_path, Manifest())
+    _, report = _sync(sources["mcp"], scoped)
 
     assert report.versions["dated"] + report.versions["draft"] >= 0.9 * report.discovered
     assert report.discovered >= 240
 
 
-def test_mcp_covers_every_published_spec_version(tmp_path, settings, sources):
+def test_mcp_covers_every_published_spec_version(scoped, sources):
     """Version-aware retrieval is only meaningful if the versions are all there."""
-    documents, _ = _sync("mcp", sources["mcp"], settings, tmp_path, Manifest())
+    documents, _ = _sync(sources["mcp"], scoped)
 
     versions = {document.version for document in documents}
 
@@ -4489,28 +5025,23 @@ def test_mcp_covers_every_published_spec_version(tmp_path, settings, sources):
     assert "draft" in versions
 
 
-def test_second_run_skips_everything(tmp_path, settings, sources):
-    """Idempotence -- the property the scheduled task depends on."""
-    manifest = Manifest()
-    _sync("mcp", sources["mcp"], settings, tmp_path, manifest)
+def test_langchain_recursion_expands_the_python_index(scoped, sources):
+    """Recursion reaches the topic sub-indexes, not just the top-level one.
 
-    _, second = _sync("mcp", sources["mcp"], settings, tmp_path, manifest)
-
-    assert second.added == 0
-    assert second.updated == 0
-    assert second.deleted == 0
-    assert second.skipped == second.discovered
-
-
-def test_langchain_recursion_expands_the_python_index(tmp_path, settings, sources):
-    documents, report = _sync("langgraph", sources["langgraph"], settings, tmp_path, Manifest())
+    2026-09-22: 539 discovered -- 369 from `/oss/python/llms.txt` plus seven
+    sibling sub-indexes (concepts, contributing, deepagents, langchain,
+    langgraph, migrate, releases). The floor is deliberately well below the
+    observed count: this asserts that recursion happened, not how big the
+    corpus is on any given day.
+    """
+    documents, report = _sync(sources["langgraph"], scoped)
 
     assert len(documents) >= 350
-    assert not report.failed
+    assert report.versions["unknown"] == len(documents)  # the corpus carries no versions
 
 
-def test_documents_are_real_markdown_with_titles(tmp_path, settings, sources):
-    documents, _ = _sync("mcp", sources["mcp"], settings, tmp_path, Manifest())
+def test_mcp_documents_are_real_markdown_with_titles(scoped, sources):
+    documents, _ = _sync(sources["mcp"], scoped)
     sample = [d for d in documents if "/specification/2026-07-28/" in d.url]
 
     assert sample, "no 2026-07-28 specification pages retrieved"
@@ -4525,12 +5056,14 @@ def test_documents_are_real_markdown_with_titles(tmp_path, settings, sources):
 - [ ] **Step 2: 跑验收测试**
 
 Run: `uv run pytest -m network -v`
-Expected: `6 passed`（首次约 1–3 分钟，取决于网络）
+Expected: `8 passed`（**实测 9 分 40 秒**。计划原文记「1–3 分钟」——那是 6 条测试时的估算，偏了近一个量级：
+8 条各自用独立的 tmp 目录、没有缓存复用，合计约 5000 次请求。**嫌慢就把 fixtures 提到 module 作用域**
+（每条源只抓一次，约 6 分钟），但那会让 `test_second_run_skips_everything` 的两次全量跑没法省。）
 
 - [ ] **Step 3: 真实抓取一回，留下证据**
 
 Run: `uv run scripts/fetch_corpus.py --update`
-Expected 输出形态：
+Expected 输出形态（**2026-09-22 实测数字**）：
 
 ```
 fetching mcp ...
@@ -4538,31 +5071,49 @@ fetching langgraph ...
 
 fetch report  (NN.Ns)
 
+  17 failed:
+    - langgraph: …/deepagents/changelog-js.md: unexpected content type: text/html; charset=utf-8
+    …（共 16 条非 markdown）
+    - langgraph: …/deepagents/code-link.md: HTTPStatusError: … 404 …
+
   mcp        discovered=252   added=252   updated=0     skipped=0     deleted=0
              versions: 198 dated, 54 draft, 0 unknown (100% labelled)
-  langgraph  discovered=369   added=369   updated=0     skipped=0     deleted=0
-             versions: 0 dated, 0 draft, 369 unknown (0% labelled)
+  langgraph  discovered=539   added=522   updated=0     skipped=0     deleted=0
+             versions: 0 dated, 0 draft, 522 unknown (0% labelled)
 
-  total      discovered=621 added=621 updated=0 skipped=0 deleted=0
+  total      discovered=791 added=774 updated=0 skipped=0 deleted=0
 
-corpus: data\corpus.jsonl  (621 documents)
+corpus: data\corpus.jsonl  (774 documents)
 report: reports\fetch-<ts>.json
 ```
+
+**退出码是 1**（有失败即非零，供定时任务感知），这是预期行为，不是错误。
+`522 = 539 − 16 篇 HTML − 1 条 404`。
 
 - [ ] **Step 4: 再跑一次，确认幂等**
 
 Run: `uv run scripts/fetch_corpus.py --update`
-Expected: `added=0 updated=0 deleted=0`，两个源 `skipped` 等于各自 `discovered`
+Expected: `added=0 updated=0 deleted=0`，且**每个源 `skipped + 失败数 == discovered`**
+（失败页不会被 skip，所以原文那句「skipped 等于各自 discovered」是错的）：
+mcp `skipped=252`、langgraph `skipped=522`（另 17 条失败）、total `skipped=774`。
 
 - [ ] **Step 5: 跑健康检查**
 
 Run: `uv run scripts/health.py`
-Expected: `documents: 621`，`versions: 198 dated, 54 draft, 369 unknown`，无 stale 告警
+Expected（**默认合并 `data/manifests/` 下的每源一份**）：
+
+```
+manifest: data\manifests (2 sources)
+documents: 774
+versions: 198 dated, 54 draft, 522 unknown
+```
+
+无 stale 告警（首轮刚抓过）。计划原文记的 `documents: 621` 是旧语料规模。
 
 - [ ] **Step 6: 全量测试 + 提交**
 
 Run: `uv run pytest && uv run pytest -m network -q`
-Expected: 全绿
+Expected: `192 passed, 6 deselected` + `8 passed`
 
 ```bash
 git add tests/test_m1_acceptance.py
@@ -4608,7 +5159,7 @@ git commit -m "test(m1): 真实语料验收 — ≥400 篇 + 版本标注率 + �
 把 M1 行的验收标准替换为：
 
 ```markdown
-| M1 语料层 | D3 | `Source` 抽象（llms_txt + local_dir）可用；两源 ≥400 篇 `.md`；增量更新（先插后删，含崩溃测试）可运行；抓取报告输出含失败清单与 `dated`/`draft`/`unknown` 三分项；**被纳入索引的 MCP 页面版本标注率 ≥90%**（实测 252 篇 → 100%：198 日期 + 54 draft） |
+| M1 语料层 | D3 | `Source` 抽象（llms_txt + local_dir）可用；两源 ≥400 篇 `.md`（实测 774）；**每源一份 manifest**，增量更新（先插后删，含崩溃测试）可运行且跨源幂等；**非 markdown 页面按 `Content-Type` 拒收并记入失败清单**；抓取报告输出含失败清单与 `dated`/`draft`/`unknown` 三分项；**被纳入索引的 MCP 页面版本标注率 ≥90%**（实测 252 篇 → 100%：198 日期 + 54 draft） |
 ```
 
 - [ ] **Step 3: README 增加 Progress 小节**
@@ -4627,7 +5178,8 @@ git commit -m "test(m1): 真实语料验收 — ≥400 篇 + 版本标注率 + �
 - [ ] M7 交付 — README + demo
 
 语料现状：MCP 252 篇（198 日期版 + 54 draft，**版本标注率 100%**）、
-LangChain Python 369 篇，合计 621 篇。
+LangChain Python 522 篇（无版本，语料性质），合计 774 篇。
+另有 17 条上游失败被如实记入抓取报告：16 条站点以 `text/html` 返回、1 条 404。
 ```
 
 - [ ] **Step 4: 跑全量测试并提交**
