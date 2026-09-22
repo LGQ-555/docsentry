@@ -42,6 +42,23 @@ def test_fetch_records_a_timestamp():
     assert fetched.fetched_at.tzinfo is not None
 
 
+def test_fetch_carries_the_servers_content_type():
+    """The pipeline refuses a page the server did not send as markdown."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"<!DOCTYPE html>", headers={"content-type": "text/html; charset=utf-8"})
+
+    source = LlmsTxtSource(name="example", llms_txt=ROOT, client=httpx.Client(transport=httpx.MockTransport(handler)))
+
+    assert source.fetch(_ref("https://docs.example.com/a.md")).content_type == "text/html; charset=utf-8"
+
+
+def test_fetch_without_a_content_type_header_reports_none():
+    source = _source({}, binary={"https://docs.example.com/a.md": b"# A\n"})
+
+    assert source.fetch(_ref("https://docs.example.com/a.md")).content_type is None
+
+
 def test_fetch_encodes_non_ascii_as_utf8():
     body = "# 中文标题\n内容\n".encode("utf-8")
     source = _source({}, binary={"https://docs.example.com/a.md": body})

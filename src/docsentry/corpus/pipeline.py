@@ -232,6 +232,35 @@ def _fetch_all(source: Source, refs: list[DocRef], workers: int, report: SourceR
 
 def _try_fetch(source: Source, ref: DocRef) -> tuple[DocRef, Fetched | None, str | None]:
     try:
-        return ref, source.fetch(ref), None
+        fetched = source.fetch(ref)
     except Exception as exc:  # noqa: BLE001 -- any per-page failure is reportable, not fatal
         return ref, None, f"{type(exc).__name__}: {exc}"
+    unexpected = _unexpected_format(fetched)
+    if unexpected is not None:
+        return ref, None, unexpected
+    return ref, fetched, None
+
+
+# Every ``.md`` URL in both corpora answers with one of these. docs.langchain.com
+# serves ``200 text/html`` for sixteen of the URLs its index still lists
+# (reference dumps, changelogs, the academy landing page) -- pages it does not
+# publish as Markdown at all. ``text/plain`` is deliberately absent: it is not a
+# markdown claim, and a corpus that serves .md that way should show up in the
+# failure list rather than be guessed at.
+_MARKDOWN_TYPES = frozenset({"text/markdown", "text/x-markdown"})
+
+
+def _unexpected_format(fetched: Fetched) -> str | None:
+    """The reason these bytes are not what the source asked for, or ``None``.
+
+    A page rejected here is never written and never remembered, so it cannot
+    become a phantom document -- and it is reported like any other failure, which
+    is where a loss belongs. ``content_type`` of ``None`` (a source with no
+    server to ask) means no claim to check against.
+    """
+    if fetched.content_type is None:
+        return None
+    media_type = fetched.content_type.split(";", 1)[0].strip().lower()
+    if media_type in _MARKDOWN_TYPES:
+        return None
+    return f"unexpected content type: {fetched.content_type}"

@@ -18,12 +18,13 @@ class FakeSource:
     and being truthy it would block the heading fallback under test.
     """
 
-    def __init__(self, name="fake", pages=None, fail_on=(), title=""):
+    def __init__(self, name="fake", pages=None, fail_on=(), title="", content_types=None):
         self.name = name
         self.kind = SourceKind.LLMS_TXT
         self.pages = dict(pages or {})
         self.fail_on = set(fail_on)
         self.title = title
+        self.content_types = dict(content_types or {})
 
     def discover(self):
         # Deliberately NOT sorted: a source is allowed to hand back index order,
@@ -38,7 +39,12 @@ class FakeSource:
     def fetch(self, ref):
         if ref.locator in self.fail_on:
             raise RuntimeError(f"boom: {ref.locator}")
-        return Fetched(ref=ref, data=self.pages[ref.locator], fetched_at=utcnow())
+        return Fetched(
+            ref=ref,
+            data=self.pages[ref.locator],
+            fetched_at=utcnow(),
+            content_type=self.content_types.get(ref.locator),
+        )
 
     def refreshable(self):
         return True
@@ -197,6 +203,78 @@ def test_failed_page_is_not_written_to_manifest(tmp_path):
     _sync(tmp_path, source, manifest=manifest)
 
     assert "https://x/broken.md" not in manifest
+
+
+# --- the format the server actually sent -----------------------------------
+#
+# docs.langchain.com lists .md URLs it does not serve as markdown: sixteen of
+# them (reference dumps, changelogs, the academy landing page) answer
+# ``200 text/html``, and four embed a per-request CSRF token so their bytes
+# never repeat. Accepting those would put an application shell into a corpus
+# that is markdown by construction -- half of its bytes, in fact -- and the
+# four would report as ``updated`` on every single run.
+
+
+def test_page_that_is_not_markdown_is_recorded_as_failed(tmp_path):
+    source = FakeSource(
+        pages={"https://x/a.md": b"# A\n", "https://x/ref.md": b"<!DOCTYPE html>\n<html>"},
+        content_types={"https://x/ref.md": "text/html; charset=utf-8"},
+    )
+    report = SourceReport(name="fake", kind="llms_txt")
+
+    documents = _sync(tmp_path, source, report=report)
+
+    assert [document.url for document in documents] == ["https://x/a.md"]
+    assert report.added == 1
+    assert [failure["locator"] for failure in report.failed] == ["https://x/ref.md"]
+    assert "text/html" in report.failed[0]["error"]
+
+
+def test_page_that_is_not_markdown_is_not_written_or_remembered(tmp_path):
+    source = FakeSource(
+        pages={"https://x/ref.md": b"<!DOCTYPE html>"},
+        content_types={"https://x/ref.md": "text/html"},
+    )
+    manifest = Manifest()
+
+    _sync(tmp_path, source, manifest=manifest)
+
+    # Not remembered == the next run cannot mistake it for a vanished page.
+    assert "https://x/ref.md" not in manifest
+    assert list((tmp_path / "raw").rglob("*.md")) == []
+
+
+def test_only_markdown_content_types_are_accepted(tmp_path):
+    """A ``None`` type (local_dir has no server to ask) is also accepted.
+
+    ``text/plain`` is deliberately *not*: it is not a markdown claim, so a
+    corpus that serves .md that way should appear in the failure list -- where
+    it is one glance to diagnose -- rather than be guessed at.
+    """
+    source = FakeSource(
+        pages={
+            "https://x/markdown.md": b"# A\n",
+            "https://x/charset.md": b"# A\n",
+            "https://x/no-claim.md": b"# A\n",
+            "https://x/plain.md": b"# A\n",
+        },
+        content_types={
+            "https://x/markdown.md": "text/markdown",
+            "https://x/charset.md": "text/markdown; charset=utf-8",
+            "https://x/plain.md": "text/plain",
+        },
+    )
+
+    report = SourceReport(name="fake", kind="llms_txt")
+
+    documents = _sync(tmp_path, source, report=report)
+
+    assert sorted(document.url for document in documents) == [
+        "https://x/charset.md",
+        "https://x/markdown.md",
+        "https://x/no-claim.md",
+    ]
+    assert [failure["locator"] for failure in report.failed] == ["https://x/plain.md"]
 
 
 def test_version_breakdown_is_counted(tmp_path):

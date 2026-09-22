@@ -182,4 +182,9 @@ class LlmsTxtSource:
         """
         response = self.client.get(ref.locator)
         response.raise_for_status()
-        return Fetched(ref=ref, data=response.content, fetched_at=utcnow())
+        return Fetched(
+            ref=ref,
+            data=response.content,
+            fetched_at=utcnow(),
+            content_type=response.headers.get("content-type"),
+        )
