@@ -24,11 +24,19 @@ from docsentry.models import DocRef, SourceKind
 
 @dataclass
 class Fetched:
-    """Raw bytes for one reference, plus when they were retrieved."""
+    """Raw bytes for one reference, plus when they were retrieved.
+
+    ``content_type`` is the server's own claim about those bytes -- the HTTP
+    ``Content-Type`` header, or ``None`` for a source with no server to ask
+    (``local_dir`` reads files). It is carried because a source can be told to
+    expect Markdown and be handed an HTML page with a 200; the pipeline decides
+    what it will ingest, and it needs the claim to decide with.
+    """
 
     ref: DocRef
     data: bytes
     fetched_at: datetime
+    content_type: str | None = None
 
 
 @runtime_checkable
