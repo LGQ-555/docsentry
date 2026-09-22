@@ -4171,7 +4171,7 @@ def _entry(version="2026-07-28", days_old=0):
 
 
 def _manifest_of(entries):
-    """``{locator: (version, days_old)}`` -> Manifest (see the ⚠️ above)."""
+    """``{locator: (version, days_old)}`` -> Manifest -- the shape the CLI reads."""
     return Manifest(
         {
             locator: ManifestEntry(
