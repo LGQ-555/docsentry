@@ -2429,6 +2429,11 @@ git commit -m "feat(m1): Markdown 转换器 — 剥样板块 + 提标题"
 > 连带 Task 15：`fetch_corpus.py` 要 catch `ManifestUnreadable` 打一句可操作的话（路径 + 原因 + 怎么重建），
 > 否则用户看到的是一条 traceback。测试 11 → 15（改 1 条、补 4 条）。
 > **根治不在这里**——见 Task 14 开头的 ⚠️：让删除判据不再依赖 manifest 的记忆，manifest 丢失才真正只值一次重抓。
+>
+> **2026-09-22 追补**：`ManifestEntry.from_json` 现在**拒收无时区时间戳**（抛 `ValueError` → 被 `load`
+> 已有的 `except (KeyError, TypeError, ValueError)` 转成 `ManifestUnreadable`，补 1 条测试）。
+> 触发点在 Task 16：naive 值 parse 得出来，然后一路活到**第一个做日期算术的读方**才炸成 traceback。
+> 详见 Task 16 开头的 ⚠️ ②。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -4061,6 +4066,65 @@ git commit -m "feat(m1): fetch_corpus CLI — 增量更新 + 报告落盘"
 
 > 设计文档 §6.1.5 的第三条风险：**「超过 N 天未校验的文档告警」**。`fetched_at` 每次运行都刷新（Task 13 有测试），所以这个告警是真的在衡量「多久没跟源站核对过」。
 
+> **⚠️ Step 3 的 manifest 加载是对 `Manifest.load` 的一次更差的重新实现；计划 7 条测试没有一条跨过它的失败路径（2026-09-22 实测，已修）**
+>
+> **① `load_manifest_entries` 重现了 Task 11 已经修掉的那个异常枚举缺陷。** 实测 6 条探针（计划的测试
+> 一条都不覆盖这些输入）：
+>
+> | 探针输入 | Step 3 原代码 | 改用 `Manifest.load` 后 |
+> |---|---|---|
+> | manifest 存在、JSON 截断 | **exit 0**，`no manifest at … -- run fetch_corpus.py first` | exit 2，`… is unreadable: not valid JSON: …` |
+> | 合法 JSON、形状是 list | exit 1，`AttributeError` traceback | exit 2，`expected a JSON object, got list` |
+> | entry 缺 `fetched_at` | exit 1，`KeyError` traceback | exit 2，`entry '…' is malformed: 'fetched_at'` |
+> | `fetched_at` 无时区 | exit 1，`TypeError` traceback | exit 2（依赖下面 ② 的加固） |
+> | 不是 UTF-8 的字节 | exit 1，`UnicodeDecodeError` traceback | exit 2，`'utf-8' codec can't decode byte 0xff …` |
+> | `--manifest` 指向目录 | **exit 0**，`no manifest` | exit 2，`Permission denied: …` |
+>
+> 第 1、6 行是两处**谎报**：把「读不出来」说成「不存在」，退出码还是 0。这个模块的 docstring 写着
+> 「The failure this guards against is silent: a source that failed months ago leaves an index that looks
+> complete」——而它对一个损坏的 manifest 给出的回答，正是它声明要消灭的那类静默假安慰，只是升了一层：
+> 索引已经不可信，告警不响。**代价**：health.py 是设计 §6.1.5 第三条风险的载体、定时任务的判据，
+> 而日志里 `no manifest` 与「首次运行、还没抓过」**逐字不可区分**。第 5 行的
+> `UnicodeDecodeError ⊂ ValueError`（**不是** `OSError`）就是 Task 11 那条 ⚠️ 修掉的同一个错——
+> 同一个计划补在一个模块里，又在下一个模块踩了回来。
+>
+> **修法**：删掉 `load_manifest_entries`，入口直接 `Manifest.load` + catch `ManifestUnreadable` → `exit 2`
+> + 打印 `{exc}`（含路径与原因）+ 一行可操作的话。**与 `fetch_corpus.py` 对同一个异常的处置保持一致。**
+> 但**别照抄它的措辞**——两个工具的成本不同：**health.py 从不回写 manifest**，所以 Task 11
+> 「静默重建会毁掉删除基线」那条论证在这里不成立。它仍然该 exit 2，理由是另一个：**一个读不出文件的
+> 健康检查回答「一切正常」，比拒绝回答更糟**；而「删掉它重建」是 fetch 侧的决定，不由只读的诊断工具越俎代庖。
+>
+> **`stale_documents` 的参数随之由原始 JSON dict 改为 `Manifest`**：入口拿到的已是 `Manifest`，
+> 再转回 dict 等于同一份数据在一个模块里有两种表示。计划 3 条单测的夹具改用 `Manifest` /
+> `ManifestEntry` 构造；**4 条 CLI 测试逐字节不变**（它们写真实 manifest 文件，`Manifest.load` 照读）。
+> 测试计数不变：**7 passed**（实测；原计划记的 7 也无误）。
+>
+> **② `ManifestEntry.from_json` 接受无时区时间戳**（探针第 4 行）。`fromisoformat("2020-01-01T00:00:00")`
+> 合法、parse 得出来，然后在**第一个做日期算术的读方**那里炸——health.py 的 `now - fetched_at` 实测
+> `TypeError: can't subtract offset-naive and offset-aware datetimes`。修法：`from_json` 里拒收 naive，
+> 抛 `ValueError` → 被 `Manifest.load` 已有的 `except (KeyError, TypeError, ValueError)` 转成
+> `ManifestUnreadable`。**这是 Task 11 的模块**，敢改的依据：`from_json` 全仓只有一个调用方
+> （`Manifest.load`），而我们自己的写方 `utcnow()` 恒为 aware——**naive 值只可能来自手改或外部工具，
+> 那正是该被拒绝的输入**。`tests/test_manifest.py` 补 1 条：
+>
+> ```python
+> def test_naive_fetched_at_is_unreadable(tmp_path):
+>     """A timestamp with no offset parses fine, then detonates in the first
+>     reader that does date arithmetic -- reject it at the boundary instead."""
+>     path = tmp_path / "manifest.json"
+>     path.write_text(
+>         json.dumps({"https://x/a.md": {"content_hash": "h", "version": "draft",
+>                                        "fetched_at": "2020-01-01T00:00:00"}}),
+>         encoding="utf-8",
+>     )
+>
+>     with pytest.raises(ManifestUnreadable):
+>         Manifest.load(path)
+> ```
+>
+> 两处修法都已离线实测（scratch 里跑计划代码 + 计划测试，只改 import）：计划那 4 条 CLI 测试
+> 在改后**逐字节不变地通过**，7 条全绿。
+
 - [ ] **Step 1: 写失败测试**
 
 ```python
@@ -4070,6 +4134,7 @@ from datetime import datetime, timedelta, timezone
 
 from typer.testing import CliRunner
 
+from docsentry.corpus.manifest import Manifest, ManifestEntry
 from scripts.health import app, stale_documents
 
 runner = CliRunner()
@@ -4092,29 +4157,40 @@ def _entry(version="2026-07-28", days_old=0):
     }
 
 
-def test_stale_documents_flags_old_entries():
-    entries = {
-        "https://x/fresh.md": _entry(days_old=1),
-        "https://x/old.md": _entry(days_old=30),
-    }
+def _manifest_of(entries):
+    """``{locator: (version, days_old)}`` -> Manifest (see the ⚠️ above)."""
+    return Manifest(
+        {
+            locator: ManifestEntry(
+                content_hash="h", version=version, fetched_at=NOW - timedelta(days=days_old)
+            )
+            for locator, (version, days_old) in entries.items()
+        }
+    )
 
-    stale = stale_documents(entries, max_age_days=7, now=NOW)
+
+def test_stale_documents_flags_old_entries():
+    manifest = _manifest_of(
+        {"https://x/fresh.md": ("2026-07-28", 1), "https://x/old.md": ("2026-07-28", 30)}
+    )
+
+    stale = stale_documents(manifest, max_age_days=7, now=NOW)
 
     assert [locator for locator, _, _ in stale] == ["https://x/old.md"]
 
 
 def test_stale_documents_reports_days_since_check():
-    entries = {"https://x/old.md": _entry(days_old=30)}
+    manifest = _manifest_of({"https://x/old.md": ("2026-07-28", 30)})
 
-    stale = stale_documents(entries, max_age_days=7, now=NOW)
+    stale = stale_documents(manifest, max_age_days=7, now=NOW)
 
     assert stale[0][1] == 30
 
 
 def test_stale_documents_is_empty_when_all_fresh():
-    entries = {"https://x/a.md": _entry(days_old=0)}
+    manifest = _manifest_of({"https://x/a.md": ("2026-07-28", 0)})
 
-    assert stale_documents(entries, max_age_days=7, now=NOW) == []
+    assert stale_documents(manifest, max_age_days=7, now=NOW) == []
 
 
 def test_cli_summarises_versions(tmp_path):
@@ -4173,37 +4249,40 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'scripts.health'`
 Reports what the corpus believes it has, and warns about anything that has not
 been verified against its source recently. The failure this guards against is
 silent: a source that failed months ago leaves an index that looks complete.
+
+Reading goes through ``Manifest.load`` rather than re-parsing the JSON here (see
+the ⚠️ above). There is one loader for this file and it already draws the line
+between "no manifest yet" and "manifest present but unusable"; a second, weaker
+parser beside it would report a corrupt manifest as a missing one -- which is
+the same silent-completeness failure this module exists to surface, one level up.
+
+Unlike ``fetch_corpus``, this script never writes the manifest, so an unreadable
+one cannot cost us the deletion baseline. It aborts anyway: a health check that
+answers "nothing to report" for a file it could not read is worse than one that
+refuses to answer.
 """
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from pathlib import Path
 
 import typer
 
 from docsentry.config import Settings
+from docsentry.corpus.manifest import Manifest, ManifestUnreadable
 from docsentry.corpus.versioning import version_bucket
 
 app = typer.Typer(add_completion=False, help="Report corpus health and staleness.")
 
 
-def load_manifest_entries(path: Path) -> dict:
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return {}
-
-
-def stale_documents(entries: dict, *, max_age_days: int, now: datetime):
+def stale_documents(manifest: Manifest, *, max_age_days: int, now: datetime):
     """``[(locator, days_since_check, version)]`` for entries older than the limit."""
     stale = []
-    for locator, entry in entries.items():
-        fetched_at = datetime.fromisoformat(entry["fetched_at"])
-        age_days = (now - fetched_at).days
+    for locator, entry in manifest.items():
+        age_days = (now - entry.fetched_at).days
         if age_days > max_age_days:
-            stale.append((locator, age_days, entry.get("version", "unknown")))
+            stale.append((locator, age_days, entry.version))
     return sorted(stale, key=lambda item: item[1], reverse=True)
 
 
@@ -4215,22 +4294,31 @@ def main(
 ) -> None:
     settings = Settings()
     path = manifest or settings.manifest_path
-    entries = load_manifest_entries(path)
+    try:
+        corpus_manifest = Manifest.load(path)
+    except ManifestUnreadable as exc:
+        typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+        typer.secho(
+            "       the corpus is unverified until this is resolved;"
+            " run fetch_corpus.py to rebuild it.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
 
-    if not entries:
+    if not corpus_manifest:
         typer.echo(f"no manifest at {path} -- run fetch_corpus.py first")
         raise typer.Exit(code=0)
 
     buckets = {"dated": 0, "draft": 0, "unknown": 0}
-    for entry in entries.values():
-        buckets[version_bucket(entry.get("version", "unknown"))] += 1
+    for _, entry in corpus_manifest.items():
+        buckets[version_bucket(entry.version)] += 1
 
     typer.echo(f"manifest: {path}")
-    typer.echo(f"documents: {len(entries)}")
+    typer.echo(f"documents: {len(corpus_manifest)}")
     typer.echo(f"versions: {buckets['dated']} dated, {buckets['draft']} draft, {buckets['unknown']} unknown")
 
     current = datetime.fromisoformat(now) if now else datetime.now(timezone.utc)
-    stale = stale_documents(entries, max_age_days=max_age_days, now=current)
+    stale = stale_documents(corpus_manifest, max_age_days=max_age_days, now=current)
     if stale:
         typer.secho(f"\nstale: {len(stale)} documents unverified for over {max_age_days} days", fg=typer.colors.YELLOW)
         for locator, age_days, version in stale[:20]:
