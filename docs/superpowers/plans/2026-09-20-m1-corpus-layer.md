@@ -4097,7 +4097,6 @@ git commit -m "feat(m1): fetch_corpus CLI — 增量更新 + 报告落盘"
 > **`stale_documents` 的参数随之由原始 JSON dict 改为 `Manifest`**：入口拿到的已是 `Manifest`，
 > 再转回 dict 等于同一份数据在一个模块里有两种表示。计划 3 条单测的夹具改用 `Manifest` /
 > `ManifestEntry` 构造；**4 条 CLI 测试逐字节不变**（它们写真实 manifest 文件，`Manifest.load` 照读）。
-> 测试计数不变：**7 passed**（实测；原计划记的 7 也无误）。
 >
 > **② `ManifestEntry.from_json` 接受无时区时间戳**（探针第 4 行）。`fromisoformat("2020-01-01T00:00:00")`
 > 合法、parse 得出来，然后在**第一个做日期算术的读方**那里炸——health.py 的 `now - fetched_at` 实测
@@ -4108,22 +4107,36 @@ git commit -m "feat(m1): fetch_corpus CLI — 增量更新 + 报告落盘"
 > 那正是该被拒绝的输入**。`tests/test_manifest.py` 补 1 条：
 >
 > ```python
-> def test_naive_fetched_at_is_unreadable(tmp_path):
->     """A timestamp with no offset parses fine, then detonates in the first
->     reader that does date arithmetic -- reject it at the boundary instead."""
+> def test_load_naive_timestamp_raises(tmp_path):
+>     # A timestamp with no offset parses fine, then detonates in the first reader
+>     # that does date arithmetic (`now - fetched_at`). We only ever write
+>     # utcnow(), so a naive value is foreign by construction -- reject it at the
+>     # boundary, where the fault is still attributable to a file.
 >     path = tmp_path / "manifest.json"
 >     path.write_text(
->         json.dumps({"https://x/a.md": {"content_hash": "h", "version": "draft",
->                                        "fetched_at": "2020-01-01T00:00:00"}}),
+>         json.dumps(
+>             {"https://x/a.md": {"content_hash": "h", "version": "draft", "fetched_at": "2020-01-01T00:00:00"}}
+>         ),
 >         encoding="utf-8",
 >     )
 >
->     with pytest.raises(ManifestUnreadable):
+>     with pytest.raises(ManifestUnreadable, match="unreadable") as excinfo:
 >         Manifest.load(path)
+>
+>     assert "no timezone" in excinfo.value.reason
 > ```
 >
-> 两处修法都已离线实测（scratch 里跑计划代码 + 计划测试，只改 import）：计划那 4 条 CLI 测试
-> 在改后**逐字节不变地通过**，7 条全绿。
+> **③ 补 2 条守卫测试（2026-09-22）。** 上表的 P1 与 P5 是两处具体缺陷，但修完之后，
+> 「读不出文件就拒绝回答」这条契约**在测试里没有任何一处被钉住**——下一次把 `except` 改回
+> 静默返回 `{}`，套件照样全绿。而 health.py 的 docstring 现在正是拿这条当核心承诺写的。
+> 两条守卫各钉一个已经咬过人的事实：截断 JSON（不许谎报成 `no manifest` + 退出码 2 + 输出含路径）、
+> 非 UTF-8 字节（`UnicodeDecodeError ⊂ ValueError`，**不是** `OSError`）。
+>
+> **测试计数：7 → 9**（原计划的 7 无误，2 条是新增守卫；Step 4 的预期同步改为 `9 passed`）。
+>
+> 三处改动都已离线实测（scratch 里跑计划代码 + 计划测试，只改 import）：计划那 4 条 CLI 测试
+> 在改后**逐字节不变地通过**，9 条全绿。**实现落地时直接按上面的代码块抄**——repo 里的
+> `scripts/health.py` 与 `tests/test_health.py` 是从本文件的代码块**提取**生成的，不是手抄的。
 
 - [ ] **Step 1: 写失败测试**
 
@@ -4233,6 +4246,33 @@ def test_cli_handles_missing_manifest(tmp_path):
 
     assert result.exit_code == 0
     assert "no manifest" in result.output.lower()
+
+
+def test_cli_refuses_to_report_on_an_unreadable_manifest(tmp_path):
+    # The plan's loader caught the exception and returned {} -- a corrupt
+    # manifest was reported as an absent one with exit code 0, which a
+    # scheduled task cannot tell apart from a first run.
+    path = tmp_path / "manifest.json"
+    path.write_bytes(b'{"https://x/a.md": {"content_hash": "h",')  # truncated write
+
+    result = runner.invoke(app, ["--manifest", str(path), "--now", NOW.isoformat()])
+
+    assert result.exit_code == 2
+    assert str(path) in result.output
+    assert "no manifest" not in result.output.lower()
+
+
+def test_cli_refuses_on_undecodable_bytes(tmp_path):
+    # UnicodeDecodeError derives from ValueError, not OSError, so an
+    # `except OSError` around the read does not catch it. That is how the first
+    # version of this escaped (see the manifest module's docstring).
+    path = tmp_path / "manifest.json"
+    path.write_bytes(b"\xff\xfe{}")  # not UTF-8
+
+    result = runner.invoke(app, ["--manifest", str(path), "--now", NOW.isoformat()])
+
+    assert result.exit_code == 2
+    assert "unreadable" in result.output.lower()
 ```
 
 - [ ] **Step 2: 跑测试确认失败**
@@ -4250,11 +4290,12 @@ Reports what the corpus believes it has, and warns about anything that has not
 been verified against its source recently. The failure this guards against is
 silent: a source that failed months ago leaves an index that looks complete.
 
-Reading goes through ``Manifest.load`` rather than re-parsing the JSON here (see
-the ⚠️ above). There is one loader for this file and it already draws the line
-between "no manifest yet" and "manifest present but unusable"; a second, weaker
-parser beside it would report a corrupt manifest as a missing one -- which is
-the same silent-completeness failure this module exists to surface, one level up.
+Reading goes through ``Manifest.load`` rather than re-parsing the JSON here.
+There is one loader for this file and it already draws the line between "no
+manifest yet" and "manifest present but unusable" (that module's docstring
+explains why the distinction is load-bearing); a second, weaker parser beside
+it would report a corrupt manifest as a missing one -- which is the same
+silent-completeness failure this module exists to surface, one level up.
 
 Unlike ``fetch_corpus``, this script never writes the manifest, so an unreadable
 one cannot cost us the deletion baseline. It aborts anyway: a health check that
@@ -4330,7 +4371,7 @@ def main(
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `uv run pytest tests/test_health.py -v`
-Expected: `7 passed`
+Expected: `9 passed`
 
 - [ ] **Step 5: 提交**
 
