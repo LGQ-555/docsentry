@@ -4,7 +4,9 @@ Excluded by default (see pyproject `addopts`). Run with:
 
     uv run pytest -m network -v
 
-Slow by design: it downloads both corpora end to end.
+Slow by design: it downloads both corpora end to end. Six of the eight tests
+read one shared first-run sync (see the `synced` fixture); only the idempotence
+test re-fetches, because two consecutive runs *are* its subject.
 
 This is the only test that talks to the real internet, and the first live run
 (2026-09-22) is why it exists: it found that a page the site does not publish
@@ -47,15 +49,18 @@ def sources():
     return {s.name: s for s in load_sources_config(CONFIG).sources}
 
 
-@pytest.fixture
-def scoped(settings, tmp_path) -> Settings:
-    """The real settings, with a data dir under tmp_path.
+def _enabled(sources) -> list:
+    return [config for config in sources.values() if config.enabled]
 
-    Same type, same derived paths -- including ``manifest_path_for`` -- so the
+
+def _scoped(settings: Settings, data_dir: Path) -> Settings:
+    """The real settings, pointed at a temp dir.
+
+    Same type and same derived paths -- including ``manifest_path_for`` -- so the
     test exercises the CLI's own layout rather than a parallel one, without
     reading or writing the repo's ``data/``.
     """
-    return settings.model_copy(update={"data_dir": tmp_path / "data", "reports_dir": tmp_path / "reports"})
+    return settings.model_copy(update={"data_dir": data_dir, "reports_dir": data_dir.parent / "reports"})
 
 
 def _sync(config, settings: Settings):
@@ -75,62 +80,58 @@ def _sync(config, settings: Settings):
     return documents, report
 
 
-def _enabled(sources):
-    return [config for config in sources.values() if config.enabled]
+def _sync_all(configs, settings: Settings):
+    return {config.name: _sync(config, settings) for config in configs}
 
 
-def test_two_sources_yield_at_least_400_documents(scoped, sources):
+@pytest.fixture(scope="module")
+def synced(settings, sources, tmp_path_factory):
+    """Both sources, one first run, shared by the tests below.
+
+    Syncing per test downloaded the two corpora seven times over (~5250 requests,
+    measured 9m40s) to observe an upstream state that cannot differ within a
+    single run. The sources still share one ``raw_root``, in config order -- that
+    is the CLI's own shape, and the reason a cross-source deletion is visible
+    here at all (`test_one_source_never_deletes_another_sources_documents` in
+    test_fetch_corpus_cli.py pins the same interaction on stubs).
+    """
+    scoped = _scoped(settings, tmp_path_factory.mktemp("corpus"))
+    return _sync_all(_enabled(sources), scoped)
+
+
+def test_two_sources_yield_at_least_400_documents(synced):
     total = 0
-    for config in _enabled(sources):
-        documents, report = _sync(config, scoped)
-
+    for name, (documents, report) in synced.items():
         # A first run has nothing to delete. Counting a deletion here means a
         # source looked at another source's baseline (or its own stray files).
-        assert report.deleted == 0, f"{config.name} deleted {report.deleted} on a first run"
-        assert len(report.failed) <= MAX_FAILURE_RATE * report.discovered, f"{config.name}: {report.failed[:5]}"
+        assert report.deleted == 0, f"{name} deleted {report.deleted} on a first run"
+        assert len(report.failed) <= MAX_FAILURE_RATE * report.discovered, f"{name}: {report.failed[:5]}"
         total += len(documents)
 
     assert total >= 400, f"only {total} documents"
 
 
-def test_second_run_skips_everything(scoped, sources):
-    """Idempotence -- the property the scheduled task depends on."""
-    for config in _enabled(sources):
-        _sync(config, scoped)
-
-    for config in _enabled(sources):
-        _, second = _sync(config, scoped)
-
-        assert second.added == 0, f"{config.name} re-added {second.added}"
-        assert second.updated == 0, f"{config.name} re-fetched {second.updated} as changed"
-        assert second.deleted == 0, f"{config.name} deleted {second.deleted}"
-        # Every discovered page is either unchanged or explained by a failure.
-        assert second.skipped + len(second.failed) == second.discovered
-
-
-def test_every_failure_names_a_reason_we_expect(scoped, sources):
+def test_every_failure_names_a_reason_we_expect(synced):
     """The report is where a loss belongs; it must never be unexplained."""
-    for config in _enabled(sources):
-        _, report = _sync(config, scoped)
-
+    for name, (_, report) in synced.items():
         for failure in report.failed:
-            assert "404" in failure["error"] or "unexpected content type" in failure["error"], failure
+            assert "404" in failure["error"] or "unexpected content type" in failure["error"], (
+                f"{name}: {failure}"
+            )
 
 
-def test_no_html_page_is_ingested(scoped, sources):
+def test_no_html_page_is_ingested(synced):
     """langchain serves sixteen `.md` URLs as `text/html`.
 
     Four of those embed a per-request CSRF token, so before this guard they
     were also the reason a second run could never report zero changes.
     """
-    for config in _enabled(sources):
-        documents, _ = _sync(config, scoped)
-
+    for name, (documents, _) in synced.items():
         for document in documents:
-            assert not document.content.lstrip().startswith("<!DOCTYPE"), document.url
+            assert not document.content.lstrip().startswith("<!DOCTYPE"), f"{name}: {document.url}"
 
 
-def test_mcp_version_labelling_is_at_least_90_percent(scoped, sources):
+def test_mcp_version_labelling_is_at_least_90_percent(synced):
     """The M1 criterion, measured over the pages actually indexed.
 
     `/docs/` + `/specification/` are 252 pages: 198 dated + 54 draft. The 95
@@ -139,15 +140,15 @@ def test_mcp_version_labelling_is_at_least_90_percent(scoped, sources):
     they cannot dilute the figure. `draft` is a real version channel and counts
     as labelled.
     """
-    _, report = _sync(sources["mcp"], scoped)
+    _, report = synced["mcp"]
 
     assert report.versions["dated"] + report.versions["draft"] >= 0.9 * report.discovered
     assert report.discovered >= 240
 
 
-def test_mcp_covers_every_published_spec_version(scoped, sources):
+def test_mcp_covers_every_published_spec_version(synced):
     """Version-aware retrieval is only meaningful if the versions are all there."""
-    documents, _ = _sync(sources["mcp"], scoped)
+    documents, _ = synced["mcp"]
 
     versions = {document.version for document in documents}
 
@@ -155,7 +156,7 @@ def test_mcp_covers_every_published_spec_version(scoped, sources):
     assert "draft" in versions
 
 
-def test_langchain_recursion_expands_the_python_index(scoped, sources):
+def test_langchain_recursion_expands_the_python_index(synced):
     """Recursion reaches the topic sub-indexes, not just the top-level one.
 
     2026-09-22: 539 discovered -- 369 from `/oss/python/llms.txt` plus seven
@@ -164,14 +165,14 @@ def test_langchain_recursion_expands_the_python_index(scoped, sources):
     observed count: this asserts that recursion happened, not how big the
     corpus is on any given day.
     """
-    documents, report = _sync(sources["langgraph"], scoped)
+    documents, report = synced["langgraph"]
 
     assert len(documents) >= 350
     assert report.versions["unknown"] == len(documents)  # the corpus carries no versions
 
 
-def test_mcp_documents_are_real_markdown_with_titles(scoped, sources):
-    documents, _ = _sync(sources["mcp"], scoped)
+def test_mcp_documents_are_real_markdown_with_titles(synced):
+    documents, _ = synced["mcp"]
     sample = [d for d in documents if "/specification/2026-07-28/" in d.url]
 
     assert sample, "no 2026-07-28 specification pages retrieved"
@@ -181,3 +182,22 @@ def test_mcp_documents_are_real_markdown_with_titles(scoped, sources):
         assert len(document.content) > 500, f"suspiciously short: {document.url}"
         # the per-page navigation banner must be gone from every page
         assert "Documentation Index" not in document.content, document.url
+
+
+def test_second_run_skips_everything(settings, sources, tmp_path):
+    """Idempotence -- the property the scheduled task depends on.
+
+    Deliberately not the shared fixture: two consecutive runs against one data
+    dir *is* the property, so it owns its corpus rather than borrowing a
+    baseline someone else established.
+    """
+    scoped = _scoped(settings, tmp_path / "data")
+    configs = _enabled(sources)
+    _sync_all(configs, scoped)
+
+    for name, (_, second) in _sync_all(configs, scoped).items():
+        assert second.added == 0, f"{name} re-added {second.added}"
+        assert second.updated == 0, f"{name} re-fetched {second.updated} as changed"
+        assert second.deleted == 0, f"{name} deleted {second.deleted}"
+        # Every discovered page is either unchanged or explained by a failure.
+        assert second.skipped + len(second.failed) == second.discovered
