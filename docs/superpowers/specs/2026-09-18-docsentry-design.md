@@ -408,9 +408,9 @@ locator 集合 diff  →  新增 / 删除 / 保留
 | `OfficeConverter` | 选做 | `markitdown` | docx / pptx / xlsx |
 | `ImageConverter` | 选做 | VLM API | 生成图片描述入索引 |
 
-#### 6.2.1 MarkdownConverter 的两处归一化（实测依据）
+#### 6.2.1 MarkdownConverter 的三处归一化（实测依据）
 
-除直读外它还做两件事，都不是"顺手清理"：
+除直读外它还做三件事，都不是"顺手清理"：
 
 **剥除页首 `> ## Documentation Index` 样板块。** MCP 与 LangChain 的每一页都带它（真实抽样 30/30 命中），实测长 **186 字符**、跨文档逐字节相同。
 
@@ -427,6 +427,39 @@ locator 集合 diff  →  新增 / 删除 / 保留
 
 **从首个标题提取 `title`**，跳过围栏代码块——否则 shell 片段里的 `#` 注释会被当成标题。`llms_txt` 源已自带标题，这一步是让裸 `local_dir` 也能用。
 
+**展开 MDX 布局容器**（2026-09-24 新增，M2 设计期间发现）。
+
+MCP 与 LangChain 都用 Mintlify 式的 MDX 容器组织内容（`<Tabs>` / `<Tab title="X">` / `<CodeGroup>`），
+容器内的正文缩进 4–6 空格，**CommonMark 把它读成缩进代码块**。后果三层：标题对解析器不可见、
+`kind` 被判成 `"code"`、第 6 步的原子规则把它整块保护起来。
+
+**影响面实测**：**1,235,578 字符 = 语料的 8.5%**，涉及 **211 篇**文档（MCP 1,106,054 + LangChain 129,524）。
+受影响的几乎全是 **MCP 的教程核心页**——`build-client.md` 在解析器眼里只有 **2 个标题**，
+而正文里实际有上百个。**这是必须修而不能记为已知限制的原因：评测的 `api` 类问题大概率命中它们，
+而切片的收益本来最该在那类题上体现。**
+
+处理规则：
+
+1. 识别布局容器并按**嵌套层级** dedent（不是固定减 4——`<CodeGroup>` 嵌在 `<Tab>` 里是两层）
+2. 带 `title` 的容器**重写成合成标题**，层级取容器内最浅标题，容器内所有标题相应 +1。
+   于是 `<Tab title="Python">` 内的 `## System Requirements` 成为 `### System Requirements`，
+   breadcrumb 得到 `Build an MCP client > Python > System Requirements`
+3. 剥语义标签留文本（`<Note>` / `<Warning>` 等）
+
+> **第 2 条是必需的**：`build-client.md` 的教程在 **7 个语言 Tab 里重复了 7 遍**
+> （Python / TypeScript / Java / Kotlin / C# / Ruby / Rust）。不区分的话 top-5 会被 7 个近乎相同的
+> chunk 占满。带上语言标签后它们可区分、可过滤，对开发者支持场景是**加分而非负担**。
+
+> ⚠️ **必须防的假标题**：朴素 dedent 会把围栏代码块内的 shell 注释（`# Create virtual environment`）
+> 顶到行首、被读成 **H1**。实测 `build-client.md` 因此从 2 个标题"暴涨"到 132 个，其中混着大量假标题。
+> **dedent 必须跟踪围栏状态**，围栏内的内容与围栏一起整体平移。这条要有专门的测试钉住。
+
+理由与完整证据见 [M2 设计文档](2026-09-24-m2-chunking-design.md) §3。
+
+> **改了 converter 不需要失效机制**：`content_hash` 是**原始字节**的哈希，而
+> `converter.convert(raw_path)` 每次运行都会重跑（`corpus/pipeline.py`），所以重跑
+> `fetch_corpus.py --update` 就会重建 `corpus.jsonl`。代价是全量重抓（约 2,370 次请求、实测 4 分 57 秒）。
+
 **多格式对私有语料是刚需**：私有语料格式更脏（PDF/Word/扫描件多），这不是"为了支持而支持"。
 
 **明确不做完整多模态**：ColPali 类视觉检索（约 5 天）在本场景收益低——开发者支持场景的图片主要是架构图与报错截图，VLM 生成 caption 入索引即可覆盖，成本约为其 1/5。
@@ -439,7 +472,20 @@ locator 集合 diff  →  新增 / 删除 / 保留
 
 **公平性约束（实验有效性的前提）**：三者共享同一 `target_size`（默认 1000 字符，见 `configs/chunking.yaml`）。**差异只体现在"切在哪里"，而非切多大。** 若尺寸不同，准确率差异无法归因于切片策略本身。
 
-允许的例外：`structural` 遇到无法切分的原子单元（超长代码块）时可超出 `target_size`，报告中记录实际尺寸。评测报告同时公布三策略的**平均 chunk 尺寸与 chunk 总数**，自证对比公平。
+评测报告公布三策略的**平均 chunk 尺寸、中位数、chunk 总数、以及总索引字符数**，自证对比公平。
+
+> **2026-09-24 实测修正（overlap 的披露）**：`fixed` 的 `overlap=200` 让它的索引字符总量达到语料的
+> **1.25×**，而 `semantic` / `structural` 切在天然边界上、无重叠，是 **1.00×**。**这个差异不消除，但必须披露。**
+> 原文只要求公布"平均尺寸与总数"，漏掉了会随 overlap 变化的"总索引字符数"。
+> 理由（为什么不给另两个也加 overlap）见 [M2 设计文档](2026-09-24-m2-chunking-design.md) 决策 4。
+
+> **2026-09-24 实测修正（原子单元的上限）**：原文允许 `structural` 的原子单元（超长代码块 / 表格）
+> 无限超出 `target_size`，只要求"报告中记录实际尺寸"。照字面实现，实测产出 **106,728 字符**的单 chunk
+> （LangChain 的 "All tools and toolkits" 表格，99% 表格内容），另有一批 80,000–90,000 字符的
+> （MCP 的 `build-server.md` / `build-client.md` 各 6 个版本）。这类 chunk 会**静默失效**——
+> embedding 按模型输入上限截断，prompt 装不下，超出部分等于不存在。
+> **改为硬上限 `max_atomic_size`（默认 4000），超过必须降级切分并标记 `split_atomic=True`。**
+> 见 M2 设计文档决策 2。
 
 #### 6.3.1 FixedSizeChunker（基线）
 
@@ -455,15 +501,37 @@ locator 集合 diff  →  新增 / 删除 / 保留
 
 1. 遍历 token 流，维护标题栈 `stack: list[(level, text)]`
 2. 遇 `heading_open` → 弹出栈中 `level >= 当前` 的项，压入当前标题
-3. 遇内容 token → 归属当前叶子 section
-4. 每个叶子 section 合并为一个 chunk，`breadcrumb = [t for _, t in stack]`
-5. 叶子 section 超过 `target_size` 时：按段落二次切分为子 chunk，**每个子 chunk 继承相同 breadcrumb**，`chunk_id` 加序号
-6. **原子单元**：代码块（`fence`）与表格整体不切断；代码块超 `max_code_size`（默认 3000 字符）时按空行 + 顶层 `def`/`class`/`function` 边界切分（启发式，代码中注明局限）
+3. 遇内容 token → 归属**当前栈顶 section**
+4. **flush-on-close**：正文累积在栈顶；遇到关闭当前标题的新标题时，**先发出这段正文再弹栈**。发出 chunk 的 `breadcrumb = [t for _, t in stack]`
+5. section 正文超过 `target_size` 时：按段落二次切分为子 chunk，**每个子 chunk 继承相同 breadcrumb**，`chunk_id` 加序号
+6. **原子单元与硬上限**：代码块（`fence`）与表格整体不切断；但超过 `max_atomic_size`（默认 4000 字符）时**必须降级切分**——表格按行切且**每个子块重复表头**，代码块按空行 + 顶层 `def`/`class`/`function` 边界切（启发式，代码中注明局限）——并标记 `split_atomic=True`
 7. `kind` 判定：代码块占比 > 70% → `"code"`；表格 > 70% → `"table"`；皆有 → `"mixed"`；否则 `"prose"`
+8. **不合并小碎片**：一个 section 一个 chunk，即使只有几十字符。仅当正文剥掉 HTML 标签与空白后为空时丢弃，**丢弃数进报告**
+
+> **2026-09-24 实测修正（step 3 / 4，最重要的一处）**：原文写"归属当前**叶子** section"、
+> "每个**叶子** section 合并为一个 chunk"。按字面实现，**非叶节点自己的正文不会成为任何 chunk**：
+> 实测丢掉 **2,618,528 字符 = 语料的 18.0%**（flush-on-close 得 16,695 chunks，只发叶子得 13,650 chunks，
+> 两者均值都是 857）。
+>
+> 最严重的一例是 `build-client.md`：全长 2,522 行**只有两个标题**（第 5 行 `# Build an MCP client`、
+> 第 2516 行 `## Next steps`），那 80,448 字符的完整教程挂在**父**节点下 —— 按字面实现产出的 chunk
+> 是 "Next steps" 那 172 个字符，**MCP 最核心的教程页整页检索不到**。同类还有 `build-server.md`
+> （89,755 × 6 版）、`deepagents/overview.md`（49,873）等，非叶正文超 500 字符的有 772 个。
+>
+> **"叶子"这个词是这处缺陷的根源**：正文属于"它所在的 section"，不属于"最终没有子标题的那个 section"。
+
+> **2026-09-24 实测补充（step 8）**：flush-on-close 之后 31.4% 的 chunk 小于 500 字符（10.1% 小于 200）。
+> **抽样 18 条后确认这些不是碎片而是精确的 API 片段**（如 `Chroma integration > Manage vector store >
+> Delete items from vector store`，179 字符），正是开发者提问的粒度；合并反而会破坏 breadcrumb 精确性，
+> 而均值已公平（`fixed` 792 vs `structural` 857，比值 1.08×）。故**不合并**。
 
 **降级路径**：解析失败（畸形 Markdown）时退回 `SemanticChunker` 并记录警告。
 
-**测试要点**（`tests/test_chunking.py`）：代码块不被切断 / 三级标题 breadcrumb 长度为 3 / 超长 section 子 chunk 均带 breadcrumb / 三策略 chunk 数量关系合理（不做精确断言）。
+**测试要点**（`tests/test_chunking.py`）：代码块不被切断 / 三级标题 breadcrumb 长度为 3 / 超长 section 子 chunk 均带 breadcrumb / 三策略 chunk 数量关系合理（不做精确断言）/ **非叶 prelude 不被丢弃** / **超 `max_atomic_size` 的表格子块重复表头** / **纯噪声 chunk 的丢弃数被计入报告**。
+
+公平性检查是**一个真的会跑的产物**（不是测试里的断言）：三策略均值两两比值 ≤ 1.30，并输出
+均值 / 中位数 / chunk 总数 / 总索引字符数。**断言按比值定，不写死绝对数**——语料本身在动
+（LangChain 的索引结构 2026-09-20 → 09-22 就重组过一次，369 → 539 篇）。
 
 ### 6.4 indexing — 建索引
 
