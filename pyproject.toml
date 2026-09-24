@@ -5,6 +5,7 @@ description = "A developer-support agent over technical documentation"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",
+    "markdown-it-py>=3.0",
     "pydantic>=2.7",
     "pydantic-settings>=2.3",
     "pyyaml>=6.0",
@@ -23,7 +24,8 @@ packages = ["src/docsentry"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q -m 'not network'"
+addopts = "-q -m 'not network and not corpus'"
 markers = [
     "network: hits the real internet; run with `uv run pytest -m network`",
+    "corpus: needs data/corpus.jsonl; run with `uv run pytest -m corpus`",
 ]
