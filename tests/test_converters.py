@@ -100,3 +100,41 @@ def test_converter_survives_undecodable_bytes(tmp_path):
 
 def test_markdown_converter_satisfies_protocol():
     assert isinstance(MarkdownConverter(), Converter)
+
+
+# --- MDX normalisation at convert time ------------------------------------
+
+def test_converter_expands_mdx_containers(tmp_path):
+    """Design spec 6.2.1: normalisation happens at convert time, before chunking
+    ever sees the document."""
+    path = tmp_path / "page.md"
+    path.write_bytes(
+        b"# Guide\n"
+        b"<Tabs>\n"
+        b'  <Tab title="Python">\n'
+        b"    ## Setup\n"
+        b"  </Tab>\n"
+        b"</Tabs>\n"
+    )
+    converted = MarkdownConverter().convert(path)
+
+    assert "<Tabs>" not in converted.text
+    assert "## Setup" in converted.text or "### Setup" in converted.text
+    assert converted.title == "Guide"
+
+
+def test_converter_still_strips_the_index_banner(tmp_path):
+    """The existing normalisation must survive the new one."""
+    path = tmp_path / "page.md"
+    path.write_bytes(
+        b"> ## Documentation Index\n"
+        b"> - [A](a.md)\n"
+        b"\n"
+        b"# Real Title\n"
+        b"\n"
+        b"Body.\n"
+    )
+    converted = MarkdownConverter().convert(path)
+
+    assert "Documentation Index" not in converted.text
+    assert converted.title == "Real Title"
