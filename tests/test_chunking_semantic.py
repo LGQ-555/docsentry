@@ -22,7 +22,7 @@ import pytest
 from docsentry.chunking.base import Chunker, accumulate_paragraphs, segment_blocks
 from docsentry.chunking.semantic import SemanticChunker
 from docsentry.config import ChunkingConfig
-from docsentry.models import Document, SourceKind
+from docsentry.models import Document, SourceKind, make_chunk_id
 
 
 def make_doc(content: str) -> Document:
@@ -172,6 +172,44 @@ def test_semantic_ceiling_leaves_surrounding_paragraphs_untouched():
     assert not chunks[-1].split_atomic
     assert all(c.split_atomic for c in chunks[1:-1])
     assert all(c.char_count <= 1500 for c in chunks)
+
+
+def test_semantic_drops_a_tag_only_piece_and_counts_it():
+    """The noise rule is a system rule (``is_noise`` in ``base.py``), not a
+    structural feature: before the M2 fix pass this strategy kept 31 tag-only
+    chunks on the real corpus -- chunks with nothing in them to embed -- while
+    ``structural`` dropped a section with the same body.
+
+    Dropping one piece must not renumber the others. The chunk id is
+    ``sha256(doc_id + ordinal + strategy)``, and incremental re-indexing (M3)
+    deletes by id: if a drop shifted its neighbours' ordinals, every following
+    chunk of that document would be re-inserted as new even though its text
+    never changed. Ordinal counts *pieces*, not emitted chunks.
+    """
+    doc = make_doc("a" * 1100 + "\n\n<div id=\"enable-section-numbers\" />\n\n" + "b" * 1100)
+    chunker = SemanticChunker(ChunkingConfig())
+
+    chunks = chunker.chunk(doc)
+
+    assert [c.text for c in chunks] == ["a" * 1100, "b" * 1100]
+    assert chunker.last_dropped == 1
+    assert chunks[1].chunk_id == make_chunk_id("d", 2, "semantic"), \
+        "the surviving piece keeps its source ordinal; the drop leaves a gap"
+
+
+def test_semantic_last_dropped_resets_per_document():
+    """The fairness check reuses one chunker across all 774 corpus documents,
+    so ``last_dropped`` must mean "dropped by the most recent ``chunk()``
+    call" -- a running counter would smear every document's drops over every
+    later one, and the published total would be arithmetic on the wrong
+    quantity."""
+    chunker = SemanticChunker(ChunkingConfig())
+    stub = '<div id="x" />'
+    chunker.chunk(make_doc("a" * 1100 + "\n\n" + stub))
+    assert chunker.last_dropped == 1
+
+    chunker.chunk(make_doc("a" * 1100 + "\n\n" + "b" * 1100))
+    assert chunker.last_dropped == 0
 
 
 def test_semantic_ceiling_applies_to_the_piece_not_just_each_block():

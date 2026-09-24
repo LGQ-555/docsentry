@@ -3,7 +3,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from docsentry.config import Settings, SourceConfig, load_chunking_config, load_sources_config
+from docsentry.config import (
+    ChunkingConfig,
+    Settings,
+    SourceConfig,
+    load_chunking_config,
+    load_sources_config,
+)
 
 
 def _write(tmp_path: Path, body: str) -> Path:
@@ -132,3 +138,70 @@ def test_chunking_config_rejects_overlap_ge_target(tmp_path):
     path.write_text("target_size: 500\noverlap: 500\n", encoding="utf-8")
     with pytest.raises(ValueError):
         load_chunking_config(path)
+
+
+def _chunking(tmp_path, body: str) -> ChunkingConfig:
+    path = tmp_path / "chunking.yaml"
+    path.write_text(body, encoding="utf-8")
+    return load_chunking_config(path)
+
+
+def test_chunking_config_accepts_the_shipped_config():
+    """The guard on editing ``configs/chunking.yaml``.
+
+    That file is the config the fairness report and the M2 acceptance tests
+    actually read, and it is user-editable, so a rule it does not satisfy would
+    take the whole milestone's measurements down with it at the next run. This
+    asserts the shipped file against the real path rather than a copy, because
+    a copy is exactly what would drift.
+    """
+    config = load_chunking_config(Path(__file__).resolve().parents[1] / "configs" / "chunking.yaml")
+
+    assert config.target_size <= config.max_atomic_size
+
+
+def test_chunking_config_rejects_target_above_the_atomic_ceiling(tmp_path):
+    """``target_size`` and ``max_atomic_size`` are both system rules, and this
+    config states them so that they contradict.
+
+    Rejected at load rather than resolved at chunk time. Picking a winner at
+    chunk time is what the code did before: under exactly this pair, ``fixed``
+    -- whose window *is* ``target_size``, since it has no notion of an atomic
+    unit -- emitted 8,000-character windows while ``semantic`` and
+    ``structural`` capped their packing at 4,000. That silently breaks the one
+    thing the shared ``target_size`` exists for (design spec 6.3): the three
+    strategies are supposed to differ only in *where* they cut.
+
+    The error must name both rules, because "1000 > 4000 is false" tells a
+    reader nothing about which knob to turn.
+    """
+    with pytest.raises(ValidationError) as excinfo:
+        _chunking(tmp_path, "target_size: 8000\nmax_atomic_size: 4000\n")
+
+    message = str(excinfo.value)
+    assert "target_size" in message and "max_atomic_size" in message
+
+
+def test_chunking_config_rejects_negative_overlap(tmp_path):
+    """A negative overlap is silent text loss, not just a strange number.
+
+    The stride is ``target_size - overlap``, so an overlap of -500 over a
+    1,000-character window strides 1,500: the windows stop touching and the
+    region between them is never indexed at all. Measured on a 2,500-character
+    document, the two windows cover ``[0:1000]`` and ``[1500:2500]`` and the
+    500 characters in ``[1000:1500]`` appear in no chunk. Nothing downstream
+    can see the hole -- the chunk count and the chunk sizes both look normal --
+    which is why the bound lives on the field rather than in a test.
+    """
+    with pytest.raises(ValidationError):
+        _chunking(tmp_path, "target_size: 1000\noverlap: -500\n")
+
+
+@pytest.mark.parametrize("field_name", ["target_size", "max_atomic_size", "max_code_size"])
+@pytest.mark.parametrize("value", [0, -1])
+def test_chunking_config_sizes_must_be_positive(tmp_path, field_name, value):
+    """A zero or negative size is not a smaller chunk, it is a broken one: a
+    zero window emits nothing, and a negative ceiling rejects every atomic unit
+    the corpus contains."""
+    with pytest.raises(ValidationError):
+        _chunking(tmp_path, f"{field_name}: {value}\n")

@@ -19,6 +19,17 @@ on the 2026-09-24 corpus, +1,130,208 characters of repeated headers against
 total from 1.00x to 1.08x the corpus and its chunk count from 13,088 to
 14,682. It touches 57 of 774 documents; the other 717 are byte-identical.
 
+**A second exception to "nothing is dropped": the noise rule is a system rule
+too.** Since the M2 fix pass every strategy applies ``is_noise``, so a piece
+whose whole text is HTML tags produces no chunk -- measured on the 2026-09-24
+corpus, 31 chunks across 774 documents (0.21%), which is why the counts above
+now read 14,651 chunks and 15,154,449 characters against the 14,682 /
+15,155,151 recorded when only ``structural`` applied the rule. Dropping these
+is the point: nothing in them can be embedded, and keeping them would be the
+same silent failure the ceiling exists to prevent, one step earlier.
+``last_dropped`` publishes the count, because a piece that disappears without a
+number is indistinguishable from one that was never produced.
+
 **The atomic ceiling is a system rule, not a structural feature -- M2 design
 decision 2, Task 12b.** Measured on the 2026-09-24 corpus, 288 semantic chunks
 (2.20%) exceeded ``max_atomic_size`` and held 21.5% of the indexed characters,
@@ -51,7 +62,13 @@ ordinary documents are byte-identical to before, ids included.
 
 from __future__ import annotations
 
-from docsentry.chunking.base import accumulate_paragraphs, cut_atomic, segment_blocks
+from docsentry.chunking.base import (
+    accumulate_paragraphs,
+    cut_atomic,
+    effective_target,
+    is_noise,
+    segment_blocks,
+)
 from docsentry.config import ChunkingConfig
 from docsentry.models import Chunk, Document, make_chunk_id
 
@@ -61,8 +78,13 @@ class SemanticChunker:
 
     def __init__(self, config: ChunkingConfig) -> None:
         self.config = config
+        # Dropped-chunk count for this document -- ``Chunker.last_dropped``.
+        # Reported, never silent: see ``is_noise`` in ``base.py`` for why a
+        # strategy that drops chunks owes the report a number.
+        self.last_dropped = 0
 
     def chunk(self, doc: Document) -> list[Chunk]:
+        self.last_dropped = 0
         if not doc.content:
             # ``accumulate_paragraphs`` fast-paths short text and returns
             # ``[""]`` for empty content; emitting that as a chunk would put a
@@ -70,8 +92,19 @@ class SemanticChunker:
             # yields no chunks for the same document.
             return []
         pieces = self._pieces(doc.content)
-        return [
-            Chunk(
+        chunks: list[Chunk] = []
+        for ordinal, (text, atomic) in enumerate(pieces):
+            if is_noise(text):
+                # The ordinal is the piece's position in the source, never the
+                # emitted count: a dropped piece leaves a gap in the numbering
+                # rather than renumbering its neighbours, so a chunk's id stays
+                # a function of the source text. Incremental re-indexing (M3)
+                # depends on that -- an id that shifts because an unrelated
+                # piece was dropped would delete and re-insert chunks whose
+                # content never changed.
+                self.last_dropped += 1
+                continue
+            chunks.append(Chunk(
                 chunk_id=make_chunk_id(doc.doc_id, ordinal, self.name),
                 doc_id=doc.doc_id,
                 text=text,
@@ -83,9 +116,8 @@ class SemanticChunker:
                 strategy=self.name,
                 char_count=len(text),
                 split_atomic=atomic,
-            )
-            for ordinal, (text, atomic) in enumerate(pieces)
-        ]
+            ))
+        return chunks
 
     def _pieces(self, content: str) -> list[tuple[str, bool]]:
         """``[(text, split_atomic)]`` in document order -- Task 12b.
@@ -98,8 +130,13 @@ class SemanticChunker:
         # ``target`` is capped at the ceiling: the system rule is "nothing may
         # exceed max_atomic_size", and under a config that puts the target
         # above it, the accumulator would happily build over-ceiling pieces.
+        # ``effective_target`` is the one implementation of that cap -- it used
+        # to live here (and, differently, in ``structural``). Such a config is
+        # rejected at load now (``ChunkingConfig``), so the cap is the second
+        # line of defence rather than the only one; it stays because this
+        # chunker should not rely on a check made in another module.
         ceiling = self.config.max_atomic_size
-        target = min(self.config.target_size, ceiling)
+        target = effective_target(self.config)
         base = accumulate_paragraphs(content, target)
         if all(len(piece) <= ceiling for piece in base):
             return [(piece, False) for piece in base]
@@ -124,7 +161,7 @@ class SemanticChunker:
         boundary (pipe run, fence), never mid-unit.
         """
         ceiling = self.config.max_atomic_size
-        target = min(self.config.target_size, ceiling)
+        target = effective_target(self.config)
         out: list[tuple[str, bool]] = []
         buffer: list[str] = []
         size = 0

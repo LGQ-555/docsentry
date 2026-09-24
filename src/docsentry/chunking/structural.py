@@ -35,9 +35,29 @@ honesty principle (6.9), applied to chunking by the M2 design's decision 2.
 6.3.3 step 8.** A section whose body is empty after stripping HTML tags (the
 corpus's ``<div id="enable-section-numbers" />`` stubs, image-only ``<Frame>``
 wrappers) produces no chunk, and every drop increments ``last_dropped`` so the
-report can publish the count. Short sections are *not* merged or dropped --
-corpus sampling found they are mostly precise API fragments, which is exactly
-the granularity developers query at (see ``is_noise`` in ``base.py``).
+report can publish the count: measured on the 2026-09-24 corpus, 96 chunks
+across 80 of 774 documents (0.52% of the chunks this strategy would otherwise
+produce), published as the fairness table's ``dropped`` column. Short sections
+are *not* merged or dropped -- corpus sampling found they are mostly precise
+API fragments, which is exactly the granularity developers query at (see
+``is_noise`` in ``base.py``).
+
+This used to be a ``structural`` feature; it is a system rule, and now every
+strategy applies it and keeps the same counter (``Chunker.last_dropped``). The
+review that found the discrepancy measured 31 ``semantic`` chunks and 1
+``fixed`` chunk that were tag-only and kept, while structural dropped the same
+body -- the silent degradation decision 3 exists to prevent.
+
+**Packing uses ``effective_target``, not the raw ``target_size``** -- the
+ceiling binds the packing target too, since ``configs/chunking.yaml`` is
+user-editable. Under ``target_size=8000, max_atomic_size=4000`` the raw target
+packed blocks into 272 over-ceiling chunks (largest 7,989) while ``semantic``
+respected the ceiling; the shared helper in ``base.py`` is the single
+implementation of the rule that closes that. That config is now rejected at
+load (``ChunkingConfig._target_must_fit_under_the_ceiling``), so the cap is a
+second line of defence rather than the only one -- it is still what this
+chunker packs to, so the chunker cannot be made over-ceiling by a config object
+that skipped validation.
 """
 
 from __future__ import annotations
@@ -51,6 +71,7 @@ from markdown_it import MarkdownIt
 from docsentry.chunking.base import (
     accumulate_paragraphs,
     cut_atomic,
+    effective_target,
     is_noise,
     segment_blocks,
 )
@@ -98,7 +119,8 @@ class StructuralChunker:
             )
             sections = [(self._fallback_breadcrumb(doc),
                          [(piece, False)
-                          for piece in accumulate_paragraphs(doc.content, self.config.target_size)])]
+                          for piece in accumulate_paragraphs(
+                              doc.content, effective_target(self.config))])]
 
         texts: list[tuple[list[str], str, bool]] = []
         for breadcrumb, pieces in sections:
@@ -211,7 +233,7 @@ class StructuralChunker:
         constraint), but not ``max_atomic_size``. Those are two different
         ceilings and only the first one is negotiable.
 
-        Everything else packs to ``target_size`` at block boundaries: a
+        Everything else packs to ``effective_target`` at block boundaries: a
         block is never cut internally, so a section of prose around a
         mid-size code block splits *between* the paragraphs and the code
         block, never through the code block -- not even at the blank lines
@@ -220,7 +242,16 @@ class StructuralChunker:
         row) lands whole no matter its size, so a run over the ceiling is
         hard-cut and flagged like an atomic unit rather than silently left
         to the embedding's truncation.
+
+        The packing target is capped at the ceiling (``effective_target``,
+        not the raw ``target_size``) for the same reason an atomic unit is:
+        under a user-edited config that puts the granularity above the
+        ceiling, packing to the raw target emits exactly the over-ceiling
+        chunks this ceiling exists to prevent -- measured 2026-09-24 as 272
+        chunks, the largest 7,989. Under the shipped config the cap is the
+        identity, so nothing about the recorded measurements moves.
         """
+        target = effective_target(self.config)
         text = "".join(body_lines).strip()
         if not text:
             return []
@@ -235,7 +266,7 @@ class StructuralChunker:
                     buffer = ""
                 pieces.extend((piece, True) for piece in cut_atomic(kind, block, self.config))
                 continue
-            if buffer and len(buffer) + len(block) + 1 > self.config.target_size:
+            if buffer and len(buffer) + len(block) + 1 > target:
                 pieces.append((buffer.strip(), False))
                 buffer = block
             else:
