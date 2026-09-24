@@ -24,7 +24,8 @@ packages = ["src/docsentry"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q -m 'not network'"
+addopts = "-q -m 'not network and not corpus'"
 markers = [
     "network: hits the real internet; run with `uv run pytest -m network`",
+    "corpus: needs data/corpus.jsonl; run with `uv run pytest -m corpus`",
 ]

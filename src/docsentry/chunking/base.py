@@ -169,7 +169,16 @@ def cut_atomic(kind: str, block: str, config: ChunkingConfig) -> list[str]:
 
     if kind == "table":
         budget = min(config.target_size, ceiling)
-        if len(lines) >= 3 and _DELIM_RE.match(lines[1]):
+        # A piece is `header + up to `budget` of rows`, so repeating the header
+        # only keeps the ceiling when `header + budget <= ceiling`. Without this
+        # check a table whose header is wider than ``ceiling - budget`` emits
+        # pieces that exceed the very limit this function exists to enforce.
+        # Measured 2026-09-24: the widest header on the corpus is 2,028 chars
+        # against a 3,000 allowance, so the condition holds everywhere today and
+        # the guard is a no-op on the current data -- which is the point of
+        # adding it before some future corpus finds the case.
+        header_fits = len("".join(lines[:2])) + budget <= ceiling
+        if len(lines) >= 3 and _DELIM_RE.match(lines[1]) and header_fits:
             header, rows = lines[:2], lines[2:]
         else:
             header, rows = [], lines
@@ -249,8 +258,12 @@ class SizeStats:
     """What the fairness report publishes -- design spec 6.3.
 
     ``total_chars`` is here because it is the number that exposes the overlap
-    difference: ``fixed`` indexes 1.25x the corpus, the structure-aware
-    strategies 1.00x. Mean size alone would hide it.
+    difference: ``fixed`` indexes 1.24x the corpus, ``semantic`` 1.08x and
+    ``structural`` 1.06x (2026-09-24, 774 documents). Mean size alone would hide
+    it. Neither structure-aware strategy sits at 1.00x: an atomic unit forced
+    over ``max_atomic_size`` repeats context -- a table's header row in every
+    piece -- which is a second path to "indexed more than the source", separate
+    from overlap.
     """
 
     count: int
