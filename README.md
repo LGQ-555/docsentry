@@ -60,16 +60,23 @@ All three chunking strategies target the same chunk size, so differences are
 attributable to *where* the split happens, not *how big* the chunks are.
 `uv run scripts/check_fairness.py` measures that on the 774-document corpus:
 
-| strategy | chunks | mean | median | total_chars | vs corpus |
-|---|---|---|---|---|---|
-| fixed | 17,941 | 973 | 1000 | 17,465,289 | 1.24x |
-| semantic | 14,682 | 1032 | 910 | 15,155,151 | 1.08x |
-| structural | 18,442 | 805 | 642 | 14,840,156 | 1.06x |
+| strategy | chunks | dropped | mean | median | total_chars | vs corpus |
+|---|---|---|---|---|---|---|
+| fixed | 17,940 | 1 | 974 | 1000 | 17,465,281 | 1.24x |
+| semantic | 14,651 | 31 | 1034 | 911 | 15,154,449 | 1.08x |
+| structural | 18,442 | 96 | 805 | 642 | 14,840,156 | 1.06x |
 
-Every mean sits inside the target's ±25% band; the worst pair is 1.28x. Indexed
+Every mean sits inside the target's ±25% band; the worst pair is 1.29x. Indexed
 characters are published rather than equalised — `fixed`'s excess is its overlap,
 while the other two exceed the source because a forced cut repeats a wide table's
 header (an atomic unit over `max_atomic_size` is split, not left unembeddable).
+
+`dropped` counts chunks with nothing retrievable in them — empty once HTML tags
+are stripped, so nothing in one can be embedded. They are not indexed, and the
+count is published rather than absorbed. For `fixed` that leaves a real gap: its
+windows partition the document, so a dropped window means those characters are
+in no chunk at all. A config whose `target_size` exceeds `max_atomic_size` is
+rejected when it loads, rather than resolved differently by each strategy.
 
 Every number in the results will be reproducible from a committed eval set.
 
