@@ -5,9 +5,21 @@ oversized ``structural`` sections, so its contract (never cut a paragraph,
 never lose a character) is pinned here once instead of per strategy.
 ``SizeStats`` is what the fairness report (design spec 6.3) publishes, and
 ``Chunker`` is the structural check the strategy implementations must satisfy.
+
+Since Task 12b, this module also hosts decision 2's forced-degradation
+helpers (``segment_blocks`` / ``block_kind`` / ``cut_atomic``), lifted out of
+``structural.py`` because ``semantic`` now consumes them too -- the ceiling
+is a system rule, not a structural feature.
 """
 
-from docsentry.chunking.base import Chunker, SizeStats, accumulate_paragraphs
+from docsentry.chunking.base import (
+    Chunker,
+    SizeStats,
+    accumulate_paragraphs,
+    cut_atomic,
+    segment_blocks,
+)
+from docsentry.config import ChunkingConfig
 
 
 def test_accumulate_respects_the_target():
@@ -85,3 +97,53 @@ def test_is_noise_strips_tags_before_judging():
     assert is_noise("   \n\n  ")
     assert not is_noise("Real content.")
     assert not is_noise("# heading only")
+
+
+# --- Task 12b: decision 2's forced-degradation helpers, now shared ---
+
+
+def test_segment_blocks_splits_at_structural_boundaries():
+    """The blocks are the unit the chunkers pack and never cut inside: blank
+    lines, fence lines (prose glued to a closing fence must not ride into the
+    code block) and pipe-line runs (a glued paragraph must not become a table
+    row)."""
+    text = (
+        "Intro paragraph.\n"
+        "\n"
+        "```python\n"
+        "x = 1\n"
+        "```\n"
+        "Glued prose after the fence.\n"
+        "| a | b |\n"
+        "| c | d |\n"
+        "Prose after the table.\n"
+    )
+    blocks = segment_blocks(text)
+
+    assert [kind for kind, _ in blocks] == ["prose", "code", "prose", "table", "prose"]
+    # Blocks are a partition: joining them reproduces the text minus the blank
+    # separators -- nothing lost, nothing moved.
+    assert "".join(block for _, block in blocks) == text.replace("\n\n", "\n")
+
+
+def test_cut_atomic_respects_the_ceiling_for_every_kind():
+    """The lifted helper is what guarantees forced cuts stay embeddable.
+    Every kind must return pieces that never exceed ``max_atomic_size``, and a
+    table cut repeats the header row + delimiter row so each piece stays
+    readable on its own."""
+    cfg = ChunkingConfig(target_size=1000, max_atomic_size=1500)
+    table = ("| key | value |\n| --- | --- |\n"
+             + "".join(f"| r{i} | v{i} |\n" for i in range(300)))
+    code = ("```python\n"
+            + "\n".join(f"def f{i}():\n    return {i}" for i in range(300))
+            + "\n```\n")
+    prose = "word " * 3000
+
+    for kind, block in (("table", table), ("code", code), ("prose", prose)):
+        pieces = cut_atomic(kind, block, cfg)
+        assert pieces, kind
+        assert all(len(piece) <= 1500 for piece in pieces), (kind, max(map(len, pieces)))
+
+    for piece in cut_atomic("table", table, cfg):
+        assert piece.startswith("| key | value |\n| --- | --- |"), \
+            "a piece of a table without its header is unreadable"

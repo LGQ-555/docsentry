@@ -129,8 +129,14 @@ class ChunkingConfig(BaseModel):
     constraint, not a convenience. ``overlap`` applies to ``fixed`` alone:
     overlap compensates for a hard cut not knowing where a boundary is, and the
     two structure-aware strategies cut *at* boundaries, so they do not need it.
-    Their indexed-character total is therefore 1.00x the corpus against
-    ``fixed``'s 1.25x -- disclosed in the report rather than equalised.
+
+    Measured indexed-character totals (2026-09-24): ``fixed`` 1.24x the corpus,
+    ``semantic`` 1.08x, ``structural`` 1.06x. The difference is disclosed in the
+    report rather than equalised -- but note it is no longer *only* the overlap:
+    ``fixed``'s 1.24x comes from its 200-character overlap, while the other two
+    exceed 1.00x because an atomic unit forced over ``max_atomic_size`` repeats
+    context (a table's header in every piece). That repetition costs 1.8% of
+    ``structural``'s total, concentrated on 12 wide-table pages.
     """
 
     target_size: int = 1000

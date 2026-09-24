@@ -28,12 +28,12 @@ of them pin defects that only show up when the plan's code is *run*:
   per-definition quota.
 * ``test_prose_glued_after_a_closing_fence_is_not_cut_as_code`` and
   ``test_prose_glued_after_a_table_carries_no_header`` -- a block glued to
-  its neighbour (no blank line) rides into ``_cut_atomic``, which would cut
+  its neighbour (no blank line) rides into ``cut_atomic``, which would cut
   prose as code / repeat the table header over prose.
 * ``test_oversized_unbroken_prose_run_is_hard_cut_and_flagged`` -- measured
-  on the corpus, 176 prose runs exceed 4,000 characters (the 106,285-char
-  one included); uncut they are the silent-failure chunks decision 2 exists
-  to eliminate.
+  on the corpus, 243 prose runs exceed 4,000 characters (the largest
+  45,241); uncut they are the silent-failure chunks decision 2 exists to
+  eliminate.
 """
 
 from datetime import datetime, timezone
@@ -267,7 +267,7 @@ def test_forced_code_pieces_pack_to_the_budget_not_per_definition():
 
 def test_prose_glued_after_a_closing_fence_is_not_cut_as_code():
     """No blank line after the closing fence: the paragraph must not glue onto
-    the code block, or ``_cut_atomic`` would cut it as code and flag it."""
+    the code block, or ``cut_atomic`` would cut it as code and flag it."""
     body = "\n".join(f"def f{i}():\n    return {i}" for i in range(300))
     doc = make_doc(
         "# A\n\n```python\n" + body + "\n```\n"
