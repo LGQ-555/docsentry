@@ -8,6 +8,7 @@ cut -- see ``SizeStats``.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from statistics import mean, median
 from typing import Protocol, runtime_checkable
@@ -36,6 +37,27 @@ def accumulate_paragraphs(text: str, target: int) -> list[str]:
     if buffer:
         pieces.append(buffer)
     return pieces
+
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def is_noise(text: str) -> bool:
+    """True when a chunk carries no retrievable content at all.
+
+    The bar is deliberately narrow: after stripping HTML tags, nothing is left.
+    Sampled from the real corpus, sub-200-character sections are mostly
+    *useful* -- precise API fragments like "Delete items from vector store"
+    (179 characters) are exactly what a developer asks about, so they are kept
+    and not merged (design spec 6.3.3 step 8). The genuinely empty ones are the
+    handful whose whole body is a layout artefact such as
+    ``<div id="enable-section-numbers" />``.
+
+    A heuristic that also dropped "short" text would have to pick a threshold,
+    and every threshold in the 100-500 range throws away chunks the sample shows
+    to be good. "Empty after stripping tags" needs no threshold.
+    """
+    return not _TAG_RE.sub("", text).strip()
 
 
 @dataclass

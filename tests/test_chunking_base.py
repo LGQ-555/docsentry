@@ -71,3 +71,17 @@ def test_a_class_without_chunk_does_not_satisfy_it():
         name = "fake"
 
     assert not isinstance(NoChunk(), Chunker)
+
+
+def test_is_noise_strips_tags_before_judging():
+    """The noise bar is deliberately narrow (design spec 6.3.3 step 8, M2
+    decision 3): only "empty after stripping HTML tags" counts. Corpus
+    sampling found sub-200-character sections are mostly precise API
+    fragments developers query for, and a heading-only body is unusual but
+    retrievable -- neither is noise."""
+    from docsentry.chunking.base import is_noise
+
+    assert is_noise('<div id="x" />')
+    assert is_noise("   \n\n  ")
+    assert not is_noise("Real content.")
+    assert not is_noise("# heading only")

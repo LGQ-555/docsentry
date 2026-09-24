@@ -133,11 +133,11 @@ class Chunk:
     authoritative value lives in the Qdrant payload, and guessing it earlier
     would misreport provenance by however long the corpus sat on disk.
 
-    ``split_atomic`` records that the chunk is a piece of an atomic unit
-    (code block or table) that exceeded ``max_atomic_size`` and had to be cut.
-    The evaluation reports on these chunks separately -- "we never cut a code
-    block" is a claim the system cannot honestly make, so it records when it
-    did instead (design spec 6.3.3 step 6).
+    ``split_atomic`` records that the chunk is a piece of a unit (code block,
+    table, or an unbroken prose run) that exceeded ``max_atomic_size`` and
+    had to be cut. The evaluation reports on these chunks separately -- "we
+    never cut a code block" is a claim the system cannot honestly make, so
+    it records when it did instead (design spec 6.3.3 step 6).
     """
 
     chunk_id: str
