@@ -12,14 +12,23 @@ helpers (``segment_blocks`` / ``block_kind`` / ``cut_atomic``), lifted out of
 is a system rule, not a structural feature.
 """
 
+from datetime import datetime, timezone
+
+import pytest
+
 from docsentry.chunking.base import (
     Chunker,
     SizeStats,
     accumulate_paragraphs,
     cut_atomic,
+    effective_target,
+    is_noise,
     segment_blocks,
 )
+from docsentry.chunking.semantic import SemanticChunker
+from docsentry.chunking.structural import StructuralChunker
 from docsentry.config import ChunkingConfig
+from docsentry.models import Document, SourceKind
 
 
 def test_accumulate_respects_the_target():
@@ -58,19 +67,24 @@ def test_size_stats_reports_what_the_fairness_check_needs():
 
 
 def test_size_stats_empty_input_is_zeroed():
-    """The fairness script excludes zero-chunk strategies via ``if s.mean`` --
-    that guard only works if empty input yields 0.0, not an exception."""
+    """A zero-chunk strategy must fail the fairness gate, and it can only be
+    reported if this returns zeros instead of raising -- the script reads
+    ``stats.mean`` to detect the case (using ``if s.mean`` to *exclude* such a
+    strategy was the bug; see ``scripts/check_fairness.py``)."""
     stats = SizeStats.from_sizes([])
     assert (stats.count, stats.mean, stats.median, stats.total_chars) == (0, 0.0, 0.0, 0)
 
 
 def test_a_conforming_class_satisfies_the_protocol():
     """Tasks 6-8's strategies are dispatched with structural ``isinstance``
-    checks; a class-level ``name`` plus a ``chunk`` method is exactly the
-    shape they ship, and ``runtime_checkable`` checks member *presence*, not
-    signatures."""
+    checks; a class-level ``name``, a class-level ``last_dropped`` and a
+    ``chunk`` method is exactly the shape they ship, and ``runtime_checkable``
+    checks member *presence*, not signatures. ``last_dropped`` is part of the
+    contract, not an extra on one class: the fairness report reads it to
+    publish design decision 3's drop count."""
     class FakeChunker:
         name = "fake"
+        last_dropped = 0
 
         def chunk(self, doc):
             return []
@@ -91,8 +105,6 @@ def test_is_noise_strips_tags_before_judging():
     sampling found sub-200-character sections are mostly precise API
     fragments developers query for, and a heading-only body is unusual but
     retrievable -- neither is noise."""
-    from docsentry.chunking.base import is_noise
-
     assert is_noise('<div id="x" />')
     assert is_noise("   \n\n  ")
     assert not is_noise("Real content.")
@@ -165,3 +177,64 @@ def test_a_header_wider_than_the_ceiling_is_not_repeated():
     assert pieces
     assert all(len(piece) <= cfg.max_atomic_size for piece in pieces), \
         max(map(len, pieces))
+
+
+# --- M2 fix pass: the ceiling binds the packing target, system-wide ---
+
+
+def test_effective_target_caps_the_granularity_at_the_ceiling():
+    """The rule had two implementations and they disagreed: ``semantic`` packed
+    to ``min(target_size, max_atomic_size)``, ``structural`` to the raw
+    ``target_size``. Under the config below that difference was measured as 272
+    ``structural`` chunks over the ceiling, the largest 7,989, while
+    ``semantic`` respected it. One rule, one function.
+
+    The config is built with ``model_construct`` because that combination is
+    now **rejected at load** -- ``ChunkingConfig`` enforces ``target_size <=
+    max_atomic_size`` (see ``tests/test_config.py``), because one config that
+    lets ``fixed`` emit 8,000-character windows while the other two cap at
+    4,000 is three strategies measuring three different things. What remains
+    here is the second line of defence: the packers call ``effective_target``,
+    so a config object that reached them without passing validation is still
+    capped rather than silently over-ceiling.
+    """
+    incoherent = ChunkingConfig.model_construct(target_size=8000, max_atomic_size=4000)
+    assert effective_target(incoherent) == 4000
+    # The identity under every config the loader accepts -- which is why no
+    # recorded measurement moves now that the load-time guard exists.
+    assert effective_target(ChunkingConfig()) == 1000
+
+
+@pytest.mark.parametrize("chunker_cls", [SemanticChunker, StructuralChunker])
+def test_every_packer_respects_the_ceiling_under_a_target_above_it(chunker_cls):
+    """Both chunkers that pack must cap their packing target, not just their
+    atomic units -- ``structural`` did not until the M2 fix pass, and emitted
+    7,989-character chunks under exactly this config.
+
+    Defence in depth, and labelled as such: the config is ``model_construct``ed
+    because ``ChunkingConfig`` now rejects it. The assertion stays because it
+    pins the packers' own contract -- "whatever config object I am handed, I
+    never emit a chunk over the ceiling" -- independently of who built that
+    object, which is the invariant the M2 acceptance test relies on.
+
+    Non-vacuity: the fixture paragraphs are large enough that a correct packer
+    still lands well above the *shipped* target (1,000), so a chunker that
+    passed this by emitting tiny chunks would fail the second assertion.
+    """
+    config = ChunkingConfig.model_construct(target_size=8000, max_atomic_size=4000)
+    doc = Document(
+        doc_id="d", source="s", kind=SourceKind.LLMS_TXT, version="v",
+        url="u", title="t", path="p",
+        content="# A\n\n" + "\n\n".join("p" * 1500 for _ in range(12)) + "\n",
+        content_hash="h", origin_format="md",
+        fetched_at=datetime(2026, 9, 24, tzinfo=timezone.utc),
+    )
+
+    chunks = chunker_cls(config).chunk(doc)
+    biggest = max(c.char_count for c in chunks)
+
+    assert biggest <= config.max_atomic_size, \
+        f"{chunker_cls.name} emitted a {biggest:,}-character chunk " \
+        f"against a {config.max_atomic_size:,} ceiling"
+    assert biggest > ChunkingConfig().target_size, \
+        "the fixture must actually exercise the larger target, not the shipped one"

@@ -10,6 +10,18 @@ Since Task 12b this module also hosts decision 2's forced-degradation helpers
 ``max_atomic_size`` ceiling is a *system* rule about what can be embedded at
 all, not a feature of the ``structural`` strategy, so both structure-aware
 chunkers consume these from here.
+
+Two more system rules live here because every strategy has to obey the same
+version of them, and a rule with three implementations is three rules:
+
+* ``effective_target`` -- the size a packer may actually fill. The ceiling
+  binds the *packing target* too, not only the atomic units; see its
+  docstring for the measured disagreement that made this explicit.
+* ``is_noise`` -- a chunk with nothing retrievable in it is not indexed, and
+  the strategy that drops it says how many it dropped (``last_dropped``, part
+  of the ``Chunker`` contract). Applied by all three strategies since the M2
+  fix pass; it was ``structural``-only before, which kept 31 ``semantic``
+  chunks and 1 ``fixed`` chunk that are unembeddable by the same argument.
 """
 
 from __future__ import annotations
@@ -46,6 +58,44 @@ def accumulate_paragraphs(text: str, target: int) -> list[str]:
     return pieces
 
 
+def effective_target(config: ChunkingConfig) -> int:
+    """The size a packer may actually fill: ``target_size`` capped by the ceiling.
+
+    One implementation of one rule, so the strategies cannot disagree about it.
+    The disagreement was real and measured (2026-09-24, 774 documents): with
+    ``target_size=8000, max_atomic_size=4000``, ``semantic`` -- which capped its
+    packing target at the ceiling -- emitted 4,000-character pieces at most,
+    while ``structural``, packing to the raw ``target_size``, emitted 272 chunks
+    over the ceiling, the largest 7,989. That is the same silent-truncation
+    failure the ceiling exists to prevent, reached through the packing target
+    instead of through an atomic unit. ``configs/chunking.yaml`` is
+    user-editable, which is why that config was reachable rather than
+    hypothetical.
+
+    **Since the load-time guard, this is defence in depth.**
+    ``ChunkingConfig`` now rejects ``target_size > max_atomic_size`` outright
+    (``_target_must_fit_under_the_ceiling`` in ``config.py``), so under every
+    config the loader accepts this function is the identity. It stays because
+    the packers must not depend on a check performed somewhere else: a
+    ``ChunkingConfig`` assembled without validation, or a future caller that
+    builds one by hand, still cannot produce an over-ceiling chunk. Tests reach
+    the non-identity branch with ``model_construct``, which is the only way to
+    get such an object now.
+
+    Note the asymmetry this preserves: an atomic unit may exceed ``target_size``
+    (the design's stated exception to the fairness constraint) but never
+    ``max_atomic_size``. Only the first of those two ceilings is negotiable, so
+    capping the packing target does not change what an atomic unit is allowed to
+    do -- ``cut_atomic`` still cuts over-ceiling units, and a whole unit under
+    the ceiling still rides into its chunk uncut.
+
+    It is the identity under the shipped config (``min(1000, 4000) == 1000``),
+    which is why every measurement recorded in this codebase is unaffected by
+    it.
+    """
+    return min(config.target_size, config.max_atomic_size)
+
+
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
@@ -63,6 +113,20 @@ def is_noise(text: str) -> bool:
     A heuristic that also dropped "short" text would have to pick a threshold,
     and every threshold in the 100-500 range throws away chunks the sample shows
     to be good. "Empty after stripping tags" needs no threshold.
+
+    **A system rule, not a structural feature.** Decision 3 (main spec 6.3.3
+    step 8) states why noise must not be indexed; nothing about that argument
+    is specific to the structural strategy, and applying it in only one place
+    left the other two indexing chunks that are unembeddable by the same
+    reasoning -- measured on the 2026-09-24 corpus, 31 ``semantic`` chunks and
+    1 ``fixed`` chunk whose text is nothing but tags, against a ``structural``
+    section with the same body being dropped. Every strategy therefore drops
+    these and records how many in ``last_dropped`` (design decision 3: "丢弃数进
+    报告，不静默"). The ``fixed`` case has a consequence worth stating: its
+    windows are a character partition, so dropping one leaves a gap in that
+    document's coverage -- intended, since an unembeddable chunk is not worth
+    indexing, but it means the union of ``fixed``'s windows no longer covers
+    every character.
     """
     return not _TAG_RE.sub("", text).strip()
 
@@ -159,8 +223,10 @@ def cut_atomic(kind: str, block: str, config: ChunkingConfig) -> list[str]:
       unbroken run) the cut is mid-construct -- which is exactly why the
       pieces are flagged. A single line longer than the whole budget is cut
       mid-line. The budget is ``max_code_size`` capped by
-      ``max_atomic_size``: the ceiling must hold even under a config that
-      puts the granularity above it.
+      ``max_atomic_size`` -- *not* by ``effective_target``: it is its own
+      knob, and capping it at a 1,000-character target would shatter a code
+      listing into ten pieces. The ceiling must hold even under a config
+      that puts the granularity above it, which is what both caps are for.
     * Prose: an unbroken run has no boundaries at all, so plain hard cuts;
       a line longer than the ceiling is cut mid-line.
     """
@@ -168,7 +234,7 @@ def cut_atomic(kind: str, block: str, config: ChunkingConfig) -> list[str]:
     lines = block.splitlines(keepends=True)
 
     if kind == "table":
-        budget = min(config.target_size, ceiling)
+        budget = effective_target(config)
         # A piece is `header + up to `budget` of rows`, so repeating the header
         # only keeps the ceiling when `header + budget <= ceiling`. Without this
         # check a table whose header is wider than ``ceiling - budget`` emits
@@ -283,14 +349,24 @@ class SizeStats:
 class Chunker(Protocol):
     """One chunking strategy.
 
+    ``last_dropped`` is part of the contract, not an extra on one class: design
+    decision 3 requires the number of dropped chunks to reach the report
+    (main spec 6.3.3 step 8, "丢弃数进报告，不静默"), and the report has one
+    channel per strategy -- the strategy itself. It means "dropped by the most
+    recent ``chunk()`` call", so any implementation must reset it at the top of
+    ``chunk()``; the fairness check reuses one instance across every document.
+
     Runtime note: ``isinstance`` works structurally -- members are checked by
-    *presence*, not by signature. ``issubclass`` does not: Python raises
-    ``TypeError`` for runtime protocols with data members such as ``name``
-    (same behaviour as the corpus-layer ``Source`` protocol). The strategies
-    are dispatched with ``isinstance``; never use ``issubclass`` here.
+    *presence*, not by signature, so a class with these names satisfies the
+    protocol whatever the annotations say. ``issubclass`` does not: Python
+    raises ``TypeError`` for runtime protocols with data members such as
+    ``name`` (same behaviour as the corpus-layer ``Source`` protocol). The
+    strategies are dispatched with ``isinstance``; never use ``issubclass``
+    here.
     """
 
     name: str
+    last_dropped: int
 
     def chunk(self, doc: Document) -> list[Chunk]:
         """Split one document. ``Document.indexed_at`` is ``None`` at this stage."""

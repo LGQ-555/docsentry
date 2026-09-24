@@ -7,10 +7,15 @@ restructured 2026-09-20 -> 09-22, 369 -> 539 documents).
 Measured on the 2026-09-24 corpus (774 documents, 14,049,846 characters);
 ``uv run scripts/check_fairness.py`` reproduces this table:
 
-    strategy     chunks    mean  median  total_chars  coverage
-    fixed        17,941     973    1000   17,465,289     1.24x
-    semantic     14,682    1032     910   15,155,151     1.08x
-    structural   18,442     805     642   14,840,156     1.06x
+    strategy     chunks  dropped    mean  median  total_chars  coverage
+    fixed        17,940        1     974    1000   17,465,281     1.24x
+    semantic     14,651       31    1034     911   15,154,449     1.08x
+    structural   18,442       96     805     642   14,840,156     1.06x
+
+(``dropped`` is design decision 3's noise count; the two baselines' counts and
+means moved from 17,941/973 and 14,682/1032 when the noise rule became a system
+rule, which is the whole of the difference between those figures and the ones
+recorded before the M2 fix pass.)
 """
 
 from __future__ import annotations
@@ -19,14 +24,22 @@ from pathlib import Path
 
 import pytest
 
+from docsentry.chunking.base import is_noise
 from docsentry.chunking.registry import STRATEGIES, build_chunker
-from docsentry.config import load_chunking_config
+from docsentry.config import Settings, load_chunking_config
 from docsentry.corpus.loader import load_corpus
 from scripts.check_fairness import MAX_DEVIATION
 
 pytestmark = pytest.mark.corpus
 
-CORPUS = Path("data/corpus.jsonl")
+# The *configured* corpus, not a literal path -- the same ``Settings().corpus_path``
+# the fairness report (and the fetch/index steps) read. A literal here would
+# quietly measure one corpus while the artefact measured another whenever
+# ``DOCSENTRY_DATA_DIR`` points somewhere else, and the divergence would be
+# invisible, which is the failure mode this whole milestone is about. The skip
+# stays predictable: it fires exactly when the configured corpus does not exist,
+# which is the same condition as before.
+CORPUS = Settings().corpus_path
 
 
 @pytest.fixture(scope="module")
@@ -127,26 +140,53 @@ def test_every_document_still_yields_chunks(documents, config):
     assert empty == []
 
 
-def test_no_chunk_is_pathologically_large(documents, config):
-    """A backstop against the failure that motivated the ceiling: without it,
-    the atomic-unit rule produced a 106,728-character chunk on the real corpus.
+def test_every_strategy_respects_the_atomic_ceiling(documents, config):
+    """The ceiling is a system rule (M2 design decision 2, main spec 6.3 step 6),
+    so it is asserted here as the invariant it is -- ``max(char_count) <=
+    max_atomic_size`` -- for **every** strategy, and as a companion that no
+    strategy indexes a chunk with nothing retrievable in it.
 
-    Measured max is now exactly 4,000 -- ``max_atomic_size`` itself -- for both
-    ``semantic`` and ``structural`` (``fixed`` is capped at 1,000 by its window).
-    The bar is deliberately *loose* at 3x that, and must not be tightened to
-    ``max_atomic_size``: ``cut_atomic`` does not actually guarantee the ceiling.
-    Its table branch emits ``header + rows`` without ever checking the header
-    against the budget, so a table whose header row is itself oversized yields
-    pieces far over -- reproduced in isolation with an 8,005-character header,
-    which produced an 8,034-character piece against a 4,000 ceiling. No document
-    in the current corpus has such a header, so the tight assertion lives in the
-    unit tests (``test_semantic_respects_the_atomic_ceiling``) where the input
-    is controlled, and this file keeps the coarse bound that catches the
-    regression that actually happened.
+    Why an inequality rather than a pinned number: the ceiling is a *bound*, and
+    where it is reached is a property of the corpus, not of the rule. Measured
+    today, ``semantic`` and ``structural`` reach it exactly (4,000 -- every
+    maximum is a forced atomic cut at the ceiling) while ``fixed`` sits at 1,000,
+    its window. Asserting ``== 4_000`` for all three would be false, asserting
+    it for the two would fail the day the corpus's largest atomic unit shrinks,
+    and neither would say anything about the rule.
+
+    This reads ``configs/chunking.yaml``, so it is also the guard on *editing*
+    that file: under ``target_size=8000, max_atomic_size=4000`` ``structural``
+    packed to the raw target and emitted 7,989-character chunks -- measured
+    against ``semantic``'s 4,000 on the same corpus, which is how the two
+    consumers of the ceiling were found to have different contracts. That
+    config can no longer be edited in at all: ``ChunkingConfig`` rejects
+    ``target_size > max_atomic_size`` at load, which is the stronger version of
+    this guard (it fires before 774 documents are chunked, not after). A
+    non-default config is not something this suite should pay 774 documents to
+    re-measure, so the unit-level assertion lives in
+    ``tests/test_chunking_base.py`` (``test_every_packer_respects_the_ceiling_
+    under_a_target_above_it``), where the config is a parameter.
+
+    The previous version of this test used a loose ``< 12_000`` bar and a false
+    rationale: it said ``cut_atomic`` cannot guarantee the ceiling because its
+    table branch does not check the header against the budget. That was true
+    before the ``header_fits`` guard landed in the same commit as the docstring,
+    and false after -- ``cut_atomic`` drops the repeated header rather than
+    exceed the ceiling, and ``tests/test_chunking_base.py``
+    (``test_a_header_wider_than_the_ceiling_is_not_repeated``) pins it. A loose
+    bar justified by a bug that is already fixed is how a real regression stays
+    inside the bar and unreported.
     """
-    biggest = max((c.char_count for c in all_chunks(documents, config, "structural")), default=0)
-
-    assert biggest < 12_000, f"largest chunk {biggest:,} -- capture in the report if intentional"
+    for name in STRATEGIES:
+        chunks = all_chunks(documents, config, name)
+        biggest = max((c.char_count for c in chunks), default=0)
+        assert biggest <= config.max_atomic_size, \
+            f"{name} emitted a {biggest:,}-character chunk against a {config.max_atomic_size:,} ceiling"
+        # An unembeddable chunk in the index is the same class of silent failure
+        # the ceiling exists to prevent, one step earlier: nothing in it can be
+        # embedded, and nothing downstream can tell it apart from a real chunk.
+        noise = [c for c in chunks if is_noise(c.text)]
+        assert not noise, f"{name} indexed {len(noise)} chunk(s) with no retrievable content"
 
 
 def test_mdx_normalisation_reached_the_corpus(documents):
@@ -177,17 +217,20 @@ def test_mdx_normalisation_reached_the_corpus(documents):
 
 
 def test_strategies_are_within_the_fairness_band(documents, config):
-    """Every mean within +/-25% of target_size -- measured 973 / 1032 / 805.
+    """Every mean within +/-25% of target_size -- measured 974 / 1034 / 805.
 
     The band constant is imported from ``scripts/check_fairness.py`` so there is
     one definition of the criterion rather than two that can drift.
 
-    The worst pair is **1.28x** (semantic 1032 vs structural 805). An earlier
-    measurement was 1.34x, above the 1.30 ratio the plan first proposed -- and
-    *not* a defect either way: structural's mean is low because design decision
-    3 deliberately does not merge small sections. See the script's docstring for
-    why the band replaced the ratio, and why the 1.34x figure is still recorded
-    even though today's spread would have satisfied the old bar.
+    The worst pair is **1.29x** (semantic 1034 vs structural 805), up from 1.28x
+    only because the noise rule (design decision 3, applied to all three
+    strategies since the M2 fix pass) removed 32 chunks from the two baselines,
+    moving their means. An earlier measurement was 1.34x, above the 1.30 ratio
+    the plan first proposed -- and *not* a defect either way: structural's mean
+    is low because design decision 3 deliberately does not merge small sections.
+    See the script's docstring for why the band replaced the ratio, and why the
+    1.34x figure is still recorded even though today's spread would have
+    satisfied the old bar.
     """
     means = {}
     for name in STRATEGIES:
