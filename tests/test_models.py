@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from docsentry.models import Document, SourceKind, hash_bytes, make_doc_id
+from docsentry.models import Document, SourceKind, hash_bytes, make_chunk_id, make_doc_id
 
 
 def test_make_doc_id_is_stable_and_16_hex():
@@ -57,3 +57,12 @@ def test_document_json_round_trip_with_indexed_at():
 
 def test_document_kind_serializes_as_string():
     assert _document().to_json()["kind"] == "llms_txt"
+
+
+def test_chunk_id_is_stable_and_strategy_scoped():
+    a = make_chunk_id("doc123", 0, "structural")
+    assert a == make_chunk_id("doc123", 0, "structural")
+    # the same position under a different strategy is a different chunk
+    assert a != make_chunk_id("doc123", 0, "fixed")
+    assert a != make_chunk_id("doc123", 1, "structural")
+    assert len(a) == 16
