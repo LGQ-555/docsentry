@@ -1,0 +1,19 @@
+# Chunking parameters -- design spec 6.3
+#
+# target_size is shared by all three strategies. That is the fairness
+# constraint: if the sizes differ, an accuracy gap cannot be attributed to
+# *where* the split happens rather than *how big* the chunks are.
+target_size: 1000
+
+# Applies to `fixed` only. Overlap compensates for a hard cut being blind to
+# boundaries; `semantic` and `structural` cut at boundaries and do not need it.
+overlap: 200
+
+# Code blocks and tables are never cut -- unless they exceed this, in which
+# case cutting is mandatory (a 106,728-character table was measured on the real
+# corpus, and the embedding model truncates it silently).
+max_atomic_size: 4000
+
+# Above this, an oversized code block is split at blank lines and top-level
+# def/class/function boundaries instead of at arbitrary characters.
+max_code_size: 3000

@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from docsentry.config import Settings, SourceConfig, load_sources_config
+from docsentry.config import Settings, SourceConfig, load_chunking_config, load_sources_config
 
 
 def _write(tmp_path: Path, body: str) -> Path:
@@ -113,3 +113,22 @@ def test_settings_env_override(monkeypatch, tmp_path):
     monkeypatch.setenv("DOCSENTRY_DATA_DIR", str(tmp_path / "elsewhere"))
 
     assert Settings().data_dir == tmp_path / "elsewhere"
+
+
+def test_chunking_config_defaults(tmp_path):
+    path = tmp_path / "chunking.yaml"
+    path.write_text("target_size: 1000\n", encoding="utf-8")
+    cfg = load_chunking_config(path)
+
+    assert cfg.target_size == 1000
+    assert cfg.overlap == 200
+    assert cfg.max_atomic_size == 4000
+    assert cfg.max_code_size == 3000
+
+
+def test_chunking_config_rejects_overlap_ge_target(tmp_path):
+    """overlap >= target_size makes the fixed window never advance."""
+    path = tmp_path / "chunking.yaml"
+    path.write_text("target_size: 500\noverlap: 500\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_chunking_config(path)

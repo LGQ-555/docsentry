@@ -86,6 +86,7 @@ class Settings(BaseSettings):
     data_dir: Path = Path("data")
     reports_dir: Path = Path("reports")
     sources_config: Path = Path("configs/sources.yaml")
+    chunking_config: Path = Path("configs/chunking.yaml")
     http_timeout_s: float = 30.0
     http_retries: int = 3
     fetch_workers: int = 8
@@ -119,3 +120,33 @@ def load_sources_config(path: Path) -> SourcesConfig:
         raise FileNotFoundError(f"sources config not found: {path}")
     raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     return SourcesConfig.model_validate(raw)
+
+
+class ChunkingConfig(BaseModel):
+    """Chunking parameters -- design spec 6.3.
+
+    ``target_size`` is shared by all three strategies; that is the fairness
+    constraint, not a convenience. ``overlap`` applies to ``fixed`` alone:
+    overlap compensates for a hard cut not knowing where a boundary is, and the
+    two structure-aware strategies cut *at* boundaries, so they do not need it.
+    Their indexed-character total is therefore 1.00x the corpus against
+    ``fixed``'s 1.25x -- disclosed in the report rather than equalised.
+    """
+
+    target_size: int = 1000
+    overlap: int = 200
+    max_atomic_size: int = 4000
+    max_code_size: int = 3000
+
+    @model_validator(mode="after")
+    def _overlap_must_advance(self):
+        if self.overlap >= self.target_size:
+            raise ValueError("overlap must be smaller than target_size, or the fixed window never advances")
+        return self
+
+
+def load_chunking_config(path: Path) -> ChunkingConfig:
+    if not path.exists():
+        raise FileNotFoundError(f"chunking config not found: {path}")
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return ChunkingConfig.model_validate(raw)
