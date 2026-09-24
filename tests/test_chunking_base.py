@@ -147,3 +147,21 @@ def test_cut_atomic_respects_the_ceiling_for_every_kind():
     for piece in cut_atomic("table", table, cfg):
         assert piece.startswith("| key | value |\n| --- | --- |"), \
             "a piece of a table without its header is unreadable"
+
+
+def test_a_header_wider_than_the_ceiling_is_not_repeated():
+    """Repeating the header keeps the ceiling only while
+    ``header + budget <= ceiling``. Measured 2026-09-24: the widest header on
+    the corpus is 2,028 chars against a 3,000 allowance, so this guard is a
+    no-op on today's data -- it exists so a future corpus cannot silently
+    produce pieces that exceed the limit the function exists to enforce."""
+    cfg = ChunkingConfig(target_size=1000, max_atomic_size=1500)
+    header = "| " + "c" * 8000 + " |\n"
+    delimiter = "|---|---|\n"
+    block = header + delimiter + "".join(f"| row{i} |\n" for i in range(50))
+
+    pieces = cut_atomic("table", block, cfg)
+
+    assert pieces
+    assert all(len(piece) <= cfg.max_atomic_size for piece in pieces), \
+        max(map(len, pieces))

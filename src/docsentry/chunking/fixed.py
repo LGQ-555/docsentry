@@ -3,10 +3,13 @@
 A hard character window with overlap. It makes no structural judgement at all,
 which is the point: it exists to show what those judgements are worth.
 
-The overlap is also why this strategy indexes 1.25x the corpus while the other
-two index 1.00x. That difference is published, not equalised -- overlap is a
+The overlap is also why this strategy indexes 1.24x the corpus, more than either
+of the other two (``semantic`` 1.08x, ``structural`` 1.06x on the 2026-09-24
+corpus). That difference is published, not equalised -- overlap is a
 compensation for cutting blind, and the structure-aware strategies do not need
-it (design spec 6.3, M2 design decision 4).
+it (design spec 6.3, M2 design decision 4). Nor does having no overlap put them
+at 1.00x: their excess over the source is the header a forced atomic cut repeats
+into every piece of a wide table.
 """
 
 from __future__ import annotations
