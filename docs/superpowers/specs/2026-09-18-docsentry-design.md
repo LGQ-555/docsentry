@@ -509,7 +509,7 @@ MCP 与 LangChain 都用 Mintlify 式的 MDX 容器组织内容（`<Tabs>` / `<T
 > 理由对 `semantic` 一样成立。故上限**提升为系统级规则**：`semantic` 同样对超过
 > `max_atomic_size` 的块强制降级切分并标记 `split_atomic=True`。**普通多段落文本行为完全不变**
 > （仍按段落切、不标记），上限只在真正的超长块上生效。
-> 落地后 semantic 的索引总量从 1.00× 升到 1.08× 语料、chunk 数从 13,088 升到 14,682，
+> 落地后 semantic 的索引总量从 1.00× 升到 1.08× 语料、chunk 数从 13,088 升到 14,651，
 > 触及 774 篇中的 57 篇，其余 717 篇逐字节不变。详见
 > [M2 设计文档](2026-09-24-m2-chunking-design.md) 决策 2。
 
@@ -543,7 +543,7 @@ MCP 与 LangChain 都用 Mintlify 式的 MDX 容器组织内容（`<Tabs>` / `<T
 > **2026-09-24 实测补充（step 8）**：flush-on-close 之后 31.4% 的 chunk 小于 500 字符（10.1% 小于 200）。
 > **抽样 18 条后确认这些不是碎片而是精确的 API 片段**（如 `Chroma integration > Manage vector store >
 > Delete items from vector store`，179 字符），正是开发者提问的粒度；合并反而会破坏 breadcrumb 精确性，
-> 而 MDX 归一化之后的实测均值是 973 / 1032 / 805（fixed / semantic / structural），
+> 而实现完成之后的实测均值是 974 / 1034 / 805（fixed / semantic / structural），
 > 全部落在 `target_size` 的 ±25% 区间内。故**不合并**。
 
 **降级路径**：解析失败（畸形 Markdown）时退回 `SemanticChunker` 并记录警告。
@@ -558,7 +558,7 @@ MCP 与 LangChain 都用 Mintlify 式的 MDX 容器组织内容（`<Tabs>` / `<T
 > 的不合并决定拉低了 `structural` 的均值：**两个各自成立的决定在一个数字上撞车了**。
 > 实验真正需要的只是"尺寸不至于成为分数差异的主因"，区间直接陈述这一点；比值是它的差代理。
 > **1.34× 仍如实公布**，不是把阈值调到过关。
-> 实现完成后的实测是 **1.28×**（973 / 1032 / 805），已经低于原来那个 1.30 门槛——
+> 实现完成后的实测是 **1.29×**（974 / 1034 / 805），已经低于原来那个 1.30 门槛——
 > **但判据不是因此才改的**，改判据的依据是上面那段论证。详见
 > [M2 设计文档](2026-09-24-m2-chunking-design.md) §6.2。
 
